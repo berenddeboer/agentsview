@@ -88,17 +88,32 @@ func runSSHStream(
 
 	cleanup := func() error {
 		if waitErr := c.Wait(); waitErr != nil {
-			msg := strings.TrimSpace(stderr.String())
-			if msg == "" {
-				return fmt.Errorf(
-					"ssh %s: %w", host, waitErr,
-				)
+			return &commandError{
+				Host:   host,
+				Stderr: strings.TrimSpace(stderr.String()),
+				Err:    waitErr,
 			}
-			return fmt.Errorf(
-				"ssh %s: %w: %s", host, waitErr, msg,
-			)
 		}
 		return nil
 	}
 	return stdout, cleanup, nil
 }
+
+// commandError reports a streamed SSH command that exited non-zero. It
+// carries the captured remote stderr so callers can tell benign tar
+// warnings (e.g. "file changed as we read it") apart from fatal
+// failures via remoteTarStderrBenign.
+type commandError struct {
+	Host   string
+	Stderr string
+	Err    error
+}
+
+func (e *commandError) Error() string {
+	if e.Stderr == "" {
+		return fmt.Sprintf("ssh %s: %v", e.Host, e.Err)
+	}
+	return fmt.Sprintf("ssh %s: %v: %s", e.Host, e.Err, e.Stderr)
+}
+
+func (e *commandError) Unwrap() error { return e.Err }
