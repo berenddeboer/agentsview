@@ -136,7 +136,10 @@ func (s *Store) attachToolCalls(ctx context.Context, msgs []db.Message) error {
 			&tc.ResultContent, &tc.SubagentSessionID); err != nil {
 			return err
 		}
-		if i, ok := index[ordinal]; ok {
+		// A negative call_index (corrupt or malformed mirror row) would
+		// skip the grow loop and panic on the [callIndex] assignment, so
+		// guard it the same way the Postgres store does.
+		if i, ok := index[ordinal]; ok && callIndex >= 0 {
 			for len(msgs[i].ToolCalls) <= callIndex {
 				msgs[i].ToolCalls = append(msgs[i].ToolCalls, db.ToolCall{})
 			}
@@ -176,7 +179,7 @@ func (s *Store) attachToolResultEvents(
 			return err
 		}
 		ev.Timestamp = formatDBTime(ts)
-		if i, ok := index[ordinal]; ok && callIndex < len(msgs[i].ToolCalls) {
+		if i, ok := index[ordinal]; ok && callIndex >= 0 && callIndex < len(msgs[i].ToolCalls) {
 			msgs[i].ToolCalls[callIndex].ResultEvents = append(
 				msgs[i].ToolCalls[callIndex].ResultEvents, ev,
 			)
