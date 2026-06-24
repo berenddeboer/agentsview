@@ -2247,7 +2247,7 @@ func duckUsageRawSQL(f db.UsageFilter, sessionID string) (string, []any) {
 
 func duckUsageLocalDateSQL(f db.UsageFilter) (string, any) {
 	if f.Timezone != "" {
-		return "strftime(timezone(?, timezone('UTC', ts)), '%Y-%m-%d')", f.Timezone
+		return "COALESCE(strftime(timezone(?, timezone('UTC', ts)), '%Y-%m-%d'), '')", f.Timezone
 	}
 	ref := time.Now().UTC()
 	if f.From != "" {
@@ -2256,7 +2256,7 @@ func duckUsageLocalDateSQL(f db.UsageFilter) (string, any) {
 		}
 	}
 	_, offset := ref.In(time.Local).Zone()
-	return "strftime(ts + (? * INTERVAL 1 SECOND), '%Y-%m-%d')", offset
+	return "COALESCE(strftime(ts + (? * INTERVAL 1 SECOND), '%Y-%m-%d'), '')", offset
 }
 
 func duckUsageCTE(f db.UsageFilter, sessionID string) (string, []any) {
@@ -2278,25 +2278,29 @@ func duckUsageCTE(f db.UsageFilter, sessionID string) (string, []any) {
 	}
 	query := fmt.Sprintf(`
 		WITH usage_raw AS (
-			%s
+			%[1]s
 		),
 		usage_normalized AS (
 			SELECT *,
 				CASE
-					WHEN source = 'message' THEN COALESCE(TRY_CAST(json_extract_string(token_json, '$.input_tokens') AS BIGINT), 0)
-					ELSE input_tokens
+					WHEN source = 'message' THEN LEAST(GREATEST(COALESCE(TRY_CAST(json_extract_string(token_json, '$.input_tokens') AS BIGINT), 0), 0), %[4]d)
+					WHEN source = 'session' THEN GREATEST(input_tokens, 0)
+					ELSE LEAST(GREATEST(input_tokens, 0), %[4]d)
 				END AS input_tokens_norm,
 				CASE
-					WHEN source = 'message' THEN COALESCE(TRY_CAST(json_extract_string(token_json, '$.output_tokens') AS BIGINT), 0)
-					ELSE output_tokens
+					WHEN source = 'message' THEN LEAST(GREATEST(COALESCE(TRY_CAST(json_extract_string(token_json, '$.output_tokens') AS BIGINT), 0), 0), %[4]d)
+					WHEN source = 'session' THEN GREATEST(output_tokens, 0)
+					ELSE LEAST(GREATEST(output_tokens, 0), %[4]d)
 				END AS output_tokens_norm,
 				CASE
-					WHEN source = 'message' THEN COALESCE(TRY_CAST(json_extract_string(token_json, '$.cache_creation_input_tokens') AS BIGINT), 0)
-					ELSE cache_create
+					WHEN source = 'message' THEN LEAST(GREATEST(COALESCE(TRY_CAST(json_extract_string(token_json, '$.cache_creation_input_tokens') AS BIGINT), 0), 0), %[4]d)
+					WHEN source = 'session' THEN GREATEST(cache_create, 0)
+					ELSE LEAST(GREATEST(cache_create, 0), %[4]d)
 				END AS cache_create_norm,
 				CASE
-					WHEN source = 'message' THEN COALESCE(TRY_CAST(json_extract_string(token_json, '$.cache_read_input_tokens') AS BIGINT), 0)
-					ELSE cache_read
+					WHEN source = 'message' THEN LEAST(GREATEST(COALESCE(TRY_CAST(json_extract_string(token_json, '$.cache_read_input_tokens') AS BIGINT), 0), 0), %[4]d)
+					WHEN source = 'session' THEN GREATEST(cache_read, 0)
+					ELSE LEAST(GREATEST(cache_read, 0), %[4]d)
 				END AS cache_read_norm,
 				CASE
 					WHEN claude_message_id != '' AND claude_request_id != ''
@@ -2307,15 +2311,15 @@ func duckUsageCTE(f db.UsageFilter, sessionID string) (string, []any) {
 						THEN 'usage:' || usage_dedup_key
 					ELSE 'row:' || session_id || ':' || source || ':' ||
 						COALESCE(CAST(message_ordinal AS VARCHAR), '') || ':' ||
-						CAST(ts AS VARCHAR) || ':' || model
+						COALESCE(CAST(ts AS VARCHAR), '') || ':' || model
 				END AS dedup_group,
-				%s AS local_date
+				%[2]s AS local_date
 			FROM usage_raw
 		),
 		usage_windowed AS (
 			SELECT *
 			FROM usage_normalized
-			WHERE %s
+			WHERE %[3]s
 		),
 		usage_ranked AS (
 			SELECT *,
@@ -2329,7 +2333,7 @@ func duckUsageCTE(f db.UsageFilter, sessionID string) (string, []any) {
 			SELECT *
 			FROM usage_ranked
 			WHERE dedup_rank = 1
-		)`, rawSQL, localDateSQL, datePred)
+		)`, rawSQL, localDateSQL, datePred, db.MaxPlausibleTokens)
 	args = append(args, localDateArg)
 	args = append(args, dateArgs...)
 	return query, args

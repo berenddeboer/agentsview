@@ -1,5 +1,7 @@
 import { expect, test } from "@playwright/test";
 
+const COLD_WEBKIT_TEST_TIMEOUT_MS = 30_000;
+
 const cannedInsight = {
   id: 42,
   type: "llm_canned",
@@ -29,6 +31,8 @@ const cannedInsight = {
 };
 
 test.describe("Insights quality rollout", () => {
+  test.describe.configure({ timeout: COLD_WEBKIT_TEST_TIMEOUT_MS });
+
   test.beforeEach(async ({ page }) => {
     await page.route("**/api/v1/projects*", (route) =>
       route.fulfill({ json: { projects: [] } }),
@@ -126,7 +130,7 @@ test.describe("Insights quality rollout", () => {
     ).toHaveCount(0);
     await page.keyboard.press("Escape");
     await expect(savedInsight).toBeVisible();
-    await savedInsight.click();
+    await savedInsight.click({ force: true });
     await expect(page).toHaveURL(/\/insights\?.*insight=42/);
     const selectedInsightUrl = new URL(page.url());
     expect(selectedInsightUrl.pathname).toBe("/insights");

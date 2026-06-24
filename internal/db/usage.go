@@ -3,12 +3,12 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
-
-	"github.com/tidwall/gjson"
 
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
 )
@@ -281,7 +281,7 @@ SELECT
 	m.session_id,
 	m.ordinal AS message_ordinal,
 	'message' AS usage_source,
-	COALESCE(m.timestamp, s.started_at) AS ts,
+	COALESCE(NULLIF(m.timestamp, ''), s.started_at, '') AS ts,
 	m.model,
 	m.token_usage,
 	0 AS input_tokens,
@@ -315,7 +315,7 @@ SELECT
 	ue.session_id,
 	ue.message_ordinal,
 	ue.source AS usage_source,
-	COALESCE(ue.occurred_at, s.started_at) AS ts,
+	COALESCE(ue.occurred_at, s.started_at, '') AS ts,
 	ue.model,
 	'' AS token_usage,
 	ue.input_tokens,
@@ -361,7 +361,7 @@ SELECT
 	m.session_id,
 	m.ordinal AS message_ordinal,
 	'message' AS usage_source,
-	COALESCE(m.timestamp, s.started_at) AS ts,
+	COALESCE(NULLIF(m.timestamp, ''), s.started_at, '') AS ts,
 	m.model,
 	m.token_usage,
 	0 AS input_tokens,
@@ -385,7 +385,7 @@ SELECT
 	ue.session_id,
 	ue.message_ordinal,
 	ue.source AS usage_source,
-	COALESCE(ue.occurred_at, s.started_at) AS ts,
+	COALESCE(ue.occurred_at, s.started_at, '') AS ts,
 	ue.model,
 	'' AS token_usage,
 	ue.input_tokens,
@@ -411,7 +411,7 @@ SELECT
 	m.session_id,
 	m.ordinal AS message_ordinal,
 	'message' AS usage_source,
-	COALESCE(m.timestamp, s.started_at) AS ts,
+	COALESCE(NULLIF(m.timestamp, ''), s.started_at, '') AS ts,
 	m.model,
 	m.token_usage,
 	0 AS input_tokens,
@@ -434,7 +434,7 @@ SELECT
 	ue.session_id,
 	ue.message_ordinal,
 	ue.source AS usage_source,
-	COALESCE(ue.occurred_at, s.started_at) AS ts,
+	COALESCE(ue.occurred_at, s.started_at, '') AS ts,
 	ue.model,
 	'' AS token_usage,
 	ue.input_tokens,
@@ -476,7 +476,7 @@ message_timestamp_rows AS MATERIALIZED (
 	SELECT
 		m.session_id,
 		m.ordinal,
-		m.timestamp,
+		NULLIF(m.timestamp, '') AS timestamp,
 		m.model,
 		m.token_usage,
 		m.claude_message_id,
@@ -707,7 +707,8 @@ func dailyUsageRowsSQLForBounds(
 	}
 
 	messageTimestampSourceWhere := usageMessageSourceEligibility +
-		"\n\tAND m.timestamp IS NOT NULL"
+		"\n\tAND m.timestamp IS NOT NULL" +
+		"\n\tAND m.timestamp != ''"
 	var messageTimestampArgs []any
 	messageTimestampSourceWhere, messageTimestampArgs =
 		f.appendUsageSourceFilterClauses(
@@ -733,7 +734,7 @@ func dailyUsageRowsSQLForBounds(
 			usageSessionEligibility, eventTimestampJoinArgs)
 
 	messageFallbackWhere := usageMessageEligibility +
-		"\n\tAND m.timestamp IS NULL"
+		"\n\tAND NULLIF(m.timestamp, '') IS NULL"
 	var messageFallbackArgs []any
 	messageFallbackWhere, messageFallbackArgs =
 		f.appendUsageBranchFilterClauses(
@@ -844,76 +845,308 @@ func scanDailyUsageRow(rows *sql.Rows) (dailyUsageScanRow, error) {
 func parseUsageTokenCounters(
 	tokenJSON string,
 ) (inputTok, outputTok, cacheCrTok, cacheRdTok int) {
-	for i := 0; i < len(tokenJSON); {
-		keyStartRel := strings.IndexByte(tokenJSON[i:], '"')
-		if keyStartRel < 0 {
+	i := skipJSONSpace(tokenJSON, 0)
+	if i >= len(tokenJSON) || tokenJSON[i] != '{' {
+		return
+	}
+	i++
+	for i < len(tokenJSON) {
+		i = skipJSONSpace(tokenJSON, i)
+		if i >= len(tokenJSON) || tokenJSON[i] == '}' {
 			break
 		}
-		keyStart := i + keyStartRel + 1
-		keyEndRel := strings.IndexByte(tokenJSON[keyStart:], '"')
-		if keyEndRel < 0 {
-			break
-		}
-		keyEnd := keyStart + keyEndRel
-		key := tokenJSON[keyStart:keyEnd]
-		valueStart, ok := usageTokenValueStart(tokenJSON, keyEnd+1)
-		if !ok {
-			i = keyEnd + 1
+		if tokenJSON[i] == ',' {
+			i++
 			continue
 		}
-		value, next := parseUsageTokenInt(tokenJSON, valueStart)
-		switch key {
-		case "input_tokens":
-			inputTok = value
-		case "output_tokens":
-			outputTok = value
-		case "cache_creation_input_tokens":
-			cacheCrTok = value
-		case "cache_read_input_tokens":
-			cacheRdTok = value
+		if tokenJSON[i] != '"' {
+			next, ok := skipJSONValue(tokenJSON, i)
+			if !ok || next <= i {
+				i++
+			} else {
+				i = next
+			}
+			continue
 		}
-		i = next
+		key, next, ok := parseJSONString(tokenJSON, i)
+		if !ok {
+			break
+		}
+		i = skipJSONSpace(tokenJSON, next)
+		if i >= len(tokenJSON) || tokenJSON[i] != ':' {
+			continue
+		}
+		i = skipJSONSpace(tokenJSON, i+1)
+		if isUsageTokenCounterKey(key) {
+			value, valueNext, ok := parseUsageTokenInt(tokenJSON, i)
+			if ok {
+				switch key {
+				case "input_tokens":
+					inputTok = value
+				case "output_tokens":
+					outputTok = value
+				case "cache_creation_input_tokens":
+					cacheCrTok = value
+				case "cache_read_input_tokens":
+					cacheRdTok = value
+				}
+			}
+			if valueNext <= i {
+				i++
+			} else {
+				i = valueNext
+			}
+			continue
+		}
+		valueNext, ok := skipJSONValue(tokenJSON, i)
+		if !ok {
+			break
+		}
+		i = valueNext
 	}
 	return
 }
 
-func usageTokenValueStart(tokenJSON string, i int) (int, bool) {
-	for i < len(tokenJSON) && isJSONSpace(tokenJSON[i]) {
-		i++
+func isUsageTokenCounterKey(key string) bool {
+	switch key {
+	case "input_tokens", "output_tokens",
+		"cache_creation_input_tokens", "cache_read_input_tokens":
+		return true
+	default:
+		return false
 	}
-	if i >= len(tokenJSON) || tokenJSON[i] != ':' {
-		return 0, false
-	}
-	i++
-	for i < len(tokenJSON) && isJSONSpace(tokenJSON[i]) {
-		i++
-	}
-	return i, i < len(tokenJSON)
 }
 
-func parseUsageTokenInt(tokenJSON string, i int) (int, int) {
-	if i < len(tokenJSON) && tokenJSON[i] == '"' {
+func skipJSONSpace(tokenJSON string, i int) int {
+	for i < len(tokenJSON) && isJSONSpace(tokenJSON[i]) {
 		i++
 	}
-	sign := 1
-	if i < len(tokenJSON) && tokenJSON[i] == '-' {
-		sign = -1
-		i++
+	return i
+}
+
+func parseJSONString(tokenJSON string, i int) (string, int, bool) {
+	if i >= len(tokenJSON) || tokenJSON[i] != '"' {
+		return "", i, false
+	}
+	for j := i + 1; j < len(tokenJSON); j++ {
+		switch tokenJSON[j] {
+		case '\\':
+			if j+1 >= len(tokenJSON) {
+				return "", len(tokenJSON), false
+			}
+			j++
+		case '"':
+			raw := tokenJSON[i : j+1]
+			var value string
+			err := json.Unmarshal([]byte(raw), &value)
+			if err != nil {
+				return "", j + 1, false
+			}
+			return value, j + 1, true
+		}
+	}
+	return "", len(tokenJSON), false
+}
+
+func parseUsageTokenInt(tokenJSON string, i int) (int, int, bool) {
+	if i >= len(tokenJSON) {
+		return 0, i, false
+	}
+	if tokenJSON[i] == '"' {
+		value, next, ok := parseJSONString(tokenJSON, i)
+		if !ok {
+			return 0, next, false
+		}
+		parsed, ok := parseUsageTokenIntLiteral(strings.TrimSpace(value))
+		return parsed, next, ok
 	}
 	start := i
-	var value int
-	for i < len(tokenJSON) && tokenJSON[i] >= '0' && tokenJSON[i] <= '9' {
-		value = value*10 + int(tokenJSON[i]-'0')
+	if tokenJSON[i] == '-' {
 		i++
 	}
-	if i == start {
-		return 0, i
+	digitStart := i
+	for i < len(tokenJSON) && tokenJSON[i] >= '0' && tokenJSON[i] <= '9' {
+		i++
 	}
-	return sign * value, i
+	if i == digitStart {
+		next, ok := skipJSONValue(tokenJSON, start)
+		if ok {
+			return 0, next, false
+		}
+		return 0, start, false
+	}
+	parsed, ok := parseUsageTokenIntLiteral(tokenJSON[start:i])
+	return parsed, i, ok
+}
+
+func parseUsageTokenIntLiteral(value string) (int, bool) {
+	parsed, err := strconv.ParseInt(value, 10, 0)
+	if err == nil {
+		return int(parsed), true
+	}
+	if numErr, ok := err.(*strconv.NumError); ok && numErr.Err == strconv.ErrRange {
+		if strings.HasPrefix(value, "-") {
+			return -int(^uint(0)>>1) - 1, true
+		}
+		return int(^uint(0) >> 1), true
+	}
+	return 0, false
+}
+
+func skipJSONValue(tokenJSON string, i int) (int, bool) {
+	i = skipJSONSpace(tokenJSON, i)
+	if i >= len(tokenJSON) {
+		return i, false
+	}
+	switch tokenJSON[i] {
+	case '"':
+		_, next, ok := parseJSONString(tokenJSON, i)
+		return next, ok
+	case '{', '[':
+		return skipJSONComposite(tokenJSON, i)
+	case 't':
+		if strings.HasPrefix(tokenJSON[i:], "true") {
+			return i + len("true"), true
+		}
+	case 'f':
+		if strings.HasPrefix(tokenJSON[i:], "false") {
+			return i + len("false"), true
+		}
+	case 'n':
+		if strings.HasPrefix(tokenJSON[i:], "null") {
+			return i + len("null"), true
+		}
+	default:
+		return skipJSONNumber(tokenJSON, i)
+	}
+	return i, false
+}
+
+func skipJSONComposite(tokenJSON string, i int) (int, bool) {
+	var stack []byte
+	switch tokenJSON[i] {
+	case '{':
+		stack = append(stack, '}')
+	case '[':
+		stack = append(stack, ']')
+	default:
+		return i, false
+	}
+	i++
+	for i < len(tokenJSON) {
+		switch tokenJSON[i] {
+		case '"':
+			_, next, ok := parseJSONString(tokenJSON, i)
+			if !ok {
+				return next, false
+			}
+			i = next
+		case '{':
+			stack = append(stack, '}')
+			i++
+		case '[':
+			stack = append(stack, ']')
+			i++
+		case '}', ']':
+			if len(stack) == 0 || tokenJSON[i] != stack[len(stack)-1] {
+				return i + 1, false
+			}
+			stack = stack[:len(stack)-1]
+			i++
+			if len(stack) == 0 {
+				return i, true
+			}
+		default:
+			i++
+		}
+	}
+	return len(tokenJSON), false
+}
+
+func skipJSONNumber(tokenJSON string, i int) (int, bool) {
+	start := i
+	if tokenJSON[i] == '-' {
+		i++
+	}
+	digitStart := i
+	for i < len(tokenJSON) && tokenJSON[i] >= '0' && tokenJSON[i] <= '9' {
+		i++
+	}
+	if i == digitStart {
+		return start, false
+	}
+	if i < len(tokenJSON) && tokenJSON[i] == '.' {
+		i++
+		fracStart := i
+		for i < len(tokenJSON) && tokenJSON[i] >= '0' && tokenJSON[i] <= '9' {
+			i++
+		}
+		if i == fracStart {
+			return start, false
+		}
+	}
+	if i < len(tokenJSON) && (tokenJSON[i] == 'e' || tokenJSON[i] == 'E') {
+		i++
+		if i < len(tokenJSON) && (tokenJSON[i] == '+' || tokenJSON[i] == '-') {
+			i++
+		}
+		expStart := i
+		for i < len(tokenJSON) && tokenJSON[i] >= '0' && tokenJSON[i] <= '9' {
+			i++
+		}
+		if i == expStart {
+			return start, false
+		}
+	}
+	return i, true
 }
 
 func isJSONSpace(b byte) bool {
 	return b == ' ' || b == '\n' || b == '\r' || b == '\t'
+}
+
+func clampedUsageRowTokens(
+	inputTokens, outputTokens, cacheCreationInputTokens,
+	cacheReadInputTokens int,
+) (inputTok, outputTok, cacheCrTok, cacheRdTok int) {
+	return ClampPlausibleTokens(int64(inputTokens)),
+		ClampPlausibleTokens(int64(outputTokens)),
+		ClampPlausibleTokens(int64(cacheCreationInputTokens)),
+		ClampPlausibleTokens(int64(cacheReadInputTokens))
+}
+
+func usageEventRowTokens(
+	source string,
+	inputTokens, outputTokens, cacheCreationInputTokens,
+	cacheReadInputTokens int,
+) (inputTok, outputTok, cacheCrTok, cacheRdTok int) {
+	if source == "session" {
+		return floorNegativeTokens(inputTokens),
+			floorNegativeTokens(outputTokens),
+			floorNegativeTokens(cacheCreationInputTokens),
+			floorNegativeTokens(cacheReadInputTokens)
+	}
+	return clampedUsageRowTokens(
+		inputTokens, outputTokens,
+		cacheCreationInputTokens, cacheReadInputTokens)
+}
+
+func floorNegativeTokens(v int) int {
+	if v < 0 {
+		return 0
+	}
+	return v
+}
+
+func clampedUsageTokenCounters(
+	tokenJSON string,
+) (inputTok, outputTok, cacheCrTok, cacheRdTok int) {
+	inputTok, outputTok, cacheCrTok, cacheRdTok =
+		parseUsageTokenCounters(tokenJSON)
+	return ClampPlausibleTokens(int64(inputTok)),
+		ClampPlausibleTokens(int64(outputTok)),
+		ClampPlausibleTokens(int64(cacheCrTok)),
+		ClampPlausibleTokens(int64(cacheRdTok))
 }
 
 func dailyUsageAmounts(
@@ -921,12 +1154,13 @@ func dailyUsageAmounts(
 ) (inputTok, outputTok, cacheCrTok, cacheRdTok int, cost, savings float64) {
 	if r.usageSource == "message" {
 		inputTok, outputTok, cacheCrTok, cacheRdTok =
-			parseUsageTokenCounters(r.tokenJSON)
+			clampedUsageTokenCounters(r.tokenJSON)
 	} else {
-		inputTok = r.inputTokens
-		outputTok = r.outputTokens
-		cacheCrTok = r.cacheCreationInputTokens
-		cacheRdTok = r.cacheReadInputTokens
+		inputTok, outputTok, cacheCrTok, cacheRdTok =
+			usageEventRowTokens(
+				r.usageSource,
+				r.inputTokens, r.outputTokens,
+				r.cacheCreationInputTokens, r.cacheReadInputTokens)
 	}
 
 	rates, _ := pricing.lookup(r.model)
@@ -1785,16 +2019,13 @@ func sessionRowCost(
 ) (cost float64, priced, contributes bool) {
 	var inTok, outTok, crTok, rdTok int
 	if r.usageSource == "message" {
-		usage := gjson.Parse(r.tokenJSON)
-		inTok = int(usage.Get("input_tokens").Int())
-		outTok = int(usage.Get("output_tokens").Int())
-		crTok = int(usage.Get("cache_creation_input_tokens").Int())
-		rdTok = int(usage.Get("cache_read_input_tokens").Int())
+		inTok, outTok, crTok, rdTok =
+			clampedUsageTokenCounters(r.tokenJSON)
 	} else {
-		inTok = r.inputTokens
-		outTok = r.outputTokens
-		crTok = r.cacheCreationInputTokens
-		rdTok = r.cacheReadInputTokens
+		inTok, outTok, crTok, rdTok = usageEventRowTokens(
+			r.usageSource,
+			r.inputTokens, r.outputTokens,
+			r.cacheCreationInputTokens, r.cacheReadInputTokens)
 	}
 
 	if r.costUSD.Valid {
