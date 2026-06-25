@@ -388,6 +388,71 @@ path.
 All listed directories are discovered, watched, and synced
 independently.
 
+### S3-Compatible Session Sources
+
+Claude and Codex session roots can also be `s3://` URIs. This is
+useful when several machines push their raw session files to object
+storage and one central AgentsView instance reads them without SSH
+access to those machines.
+
+```toml
+claude_project_dirs = [
+  "~/.claude/projects",
+  "s3://agent-archive/laptop/raw/claude",
+]
+
+codex_sessions_dirs = [
+  "~/.codex/sessions",
+  "s3://agent-archive/laptop/raw/codex",
+]
+```
+
+S3 sources are read-only inputs to the normal local sync. AgentsView
+lists matching objects, fetches each changed object to a temporary
+file, parses it with the existing Claude/Codex parser, records the
+original `s3://` URI as `file_path`, and removes the temporary file.
+No persistent local mirror is created.
+
+Credentials and endpoint configuration use standard AWS-style
+environment variables:
+
+```bash
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_REGION=us-east-1
+export AWS_S3_ENDPOINT=https://s3.amazonaws.com
+```
+
+`AWS_S3_ENDPOINT` is optional for AWS S3. Set it for S3-compatible
+services such as MinIO, Aliyun OSS, or Cloudflare R2. `http://`
+endpoints are accepted only for loopback hosts such as `localhost` or
+`127.0.0.1`. For a non-loopback HTTP endpoint, set
+`AGENTSVIEW_ALLOW_INSECURE_S3_ENDPOINT=true`; use that override only for
+trusted private networks because session transcripts travel without TLS.
+
+Expected object layouts:
+
+```text
+s3://bucket/.../<machine>/raw/claude/<project>/<uuid>.jsonl
+s3://bucket/.../<machine>/raw/claude/<project>/subagents/.../agent-*.jsonl
+s3://bucket/.../<machine>/raw/codex/2026/06/24/rollout-*.jsonl
+```
+
+The machine name is derived from the path segment immediately before
+`raw`. If no such segment exists, sessions use the local AgentsView
+machine label. Codex discovery only imports rollout files under the
+configured root plus a trailing slash, so sibling prefixes such as
+`raw/codex-backup` are ignored.
+
+S3 object `Size`, `LastModified`, and available object fingerprints
+(`ETag`, version ID, and checksum headers) are stored in the session row
+and used for unchanged-object skip checks. A later sync therefore lists
+object metadata first and downloads only objects whose source metadata
+changed or whose stored parser data is stale.
+
+S3 roots are not watched with fsnotify. They are picked up by initial
+sync, manual sync, and the periodic directory scan.
+
 ### Worktree Project Mappings
 
 The parser infers a session's project from its `cwd`, which
@@ -490,6 +555,11 @@ two mechanisms:
 Change detection uses file size, mtime, inode, and device
 tracking to validate incremental parses more reliably. A pool of
 8 workers processes files in parallel during sync.
+
+For `s3://` Claude and Codex roots, change detection uses object size,
+`LastModified`, and available object fingerprints such as ETag, version
+ID, and checksums from listing or stat calls. Object content is
+downloaded only after that metadata shows a parse may be needed.
 
 Files that fail to parse or contain no interactive content
 are cached in the `skipped_files` table and skipped on

@@ -93,9 +93,13 @@ type Engine struct {
 	// subsequent syncs, keyed by path with the file mtime
 	// at time of caching. Covers parse errors and
 	// non-interactive sessions (nil result). The file is
-	// retried when its mtime changes.
-	skipMu    gosync.RWMutex
-	skipCache map[string]int64
+	// retried when its mtime changes. S3 entries also keep an
+	// in-memory source fingerprint when one is available.
+	skipMu            gosync.RWMutex
+	skipCache         map[string]int64
+	skipFingerprints  map[string]string
+	s3CodexIndexMu    gosync.Mutex
+	s3CodexIndexCache map[string]s3CodexIndexSnapshot
 	// idPrefix and pathRewriter support remote sync:
 	// prefix all session IDs to avoid collisions, rewrite
 	// temp paths to "host:/remote/path" form.
@@ -188,6 +192,8 @@ func NewEngine(
 		machine:                 cfg.Machine,
 		blockedResultCategories: blockedCategorySet(cfg.BlockedResultCategories),
 		skipCache:               skipCache,
+		skipFingerprints:        make(map[string]string),
+		s3CodexIndexCache:       make(map[string]s3CodexIndexSnapshot),
 		ephemeral:               cfg.Ephemeral,
 		idPrefix:                cfg.IDPrefix,
 		pathRewriter:            cfg.PathRewriter,
@@ -437,6 +443,7 @@ func (e *Engine) SyncPaths(paths []string) {
 	}()
 	defer e.syncMu.Unlock()
 	defer e.clearCurrentProgress()
+	e.resetS3CodexIndexCache()
 
 	results := e.startWorkers(context.Background(), files)
 	stats = e.collectAndBatch(
@@ -530,10 +537,18 @@ func dedupeDiscoveredFiles(
 func discoveredFileKey(file parser.DiscoveredFile) string {
 	if file.Agent == parser.AgentCodex {
 		if id := parser.CodexSessionUUIDFromFilename(filepath.Base(file.Path)); id != "" {
-			return string(file.Agent) + "\x00" + id
+			return string(file.Agent) + "\x00" +
+				discoveredFileIDPrefix(file) + "\x00" + id
 		}
 	}
 	return string(file.Agent) + "\x00" + file.Path
+}
+
+func discoveredFileIDPrefix(file parser.DiscoveredFile) string {
+	if isS3SourcePath(file.Path) {
+		return s3SessionIDPrefix(file.Machine)
+	}
+	return ""
 }
 
 func preferDiscoveredFile(
@@ -2751,6 +2766,7 @@ func (e *Engine) syncAllLocked(
 		e.recordSyncStarted()
 	}
 	e.phaseStats.Reset()
+	e.resetS3CodexIndexCache()
 
 	t0 := time.Now()
 
@@ -3215,7 +3231,24 @@ func (e *Engine) filterFilesByMtime(
 			out = append(out, f)
 			continue
 		}
-		if f.Agent != parser.AgentCodex || !e.codexIndexNeedsRefreshSince(f.Path, cutoffNs) {
+		if isS3SourcePath(f.Path) && e.s3SourceMetadataChanged(f) {
+			out = append(out, f)
+			continue
+		}
+		if f.Agent != parser.AgentCodex {
+			continue
+		}
+		indexNeedsRefresh := false
+		if isS3SourcePath(f.Path) {
+			indexNeedsRefresh = e.s3CodexIndexNeedsRefreshSince(
+				f, cutoffNs,
+			)
+		} else {
+			indexNeedsRefresh = e.codexIndexNeedsRefreshSince(
+				f.Path, cutoffNs,
+			)
+		}
+		if !indexNeedsRefresh {
 			continue
 		}
 		key := discoveredFileKey(f)
@@ -3241,6 +3274,23 @@ func (e *Engine) filterFilesByMtime(
 func discoveredFileMtime(
 	file parser.DiscoveredFile,
 ) (int64, error) {
+	if strings.HasPrefix(file.Path, "s3://") {
+		if file.SourceMtime != 0 {
+			return file.SourceMtime, nil
+		}
+		stat := statS3Object
+		switch file.Agent {
+		case parser.AgentClaude:
+			stat = statClaudeS3Session
+		case parser.AgentCodex:
+			stat = statCodexS3Session
+		}
+		obj, err := stat(file.Path)
+		if err != nil {
+			return 0, err
+		}
+		return obj.LastModified.UnixNano(), nil
+	}
 	if file.Agent == parser.AgentKiro {
 		if _, _, ok := parser.ParseKiroSQLiteVirtualPath(file.Path); ok {
 			return parser.KiroSQLiteSourceMtime(file.Path)
@@ -3338,7 +3388,8 @@ func discoveredFileMtime(
 func (e *Engine) dedupeClaudeDiscoveredFiles(
 	files []parser.DiscoveredFile,
 ) []parser.DiscoveredFile {
-	bySessionID := make(map[string][]parser.DiscoveredFile)
+	byKey := make(map[string][]parser.DiscoveredFile)
+	sessionIDByKey := make(map[string]string)
 	for _, file := range files {
 		if file.Agent != parser.AgentClaude {
 			continue
@@ -3347,16 +3398,18 @@ func (e *Engine) dedupeClaudeDiscoveredFiles(
 		if sessionID == "" {
 			continue
 		}
-		bySessionID[sessionID] = append(bySessionID[sessionID], file)
+		key := claudeDiscoveredFileKey(file, sessionID)
+		byKey[key] = append(byKey[key], file)
+		sessionIDByKey[key] = sessionID
 	}
-	if len(bySessionID) == 0 {
+	if len(byKey) == 0 {
 		return files
 	}
 
-	preferred := make(map[string]parser.DiscoveredFile, len(bySessionID))
-	for sessionID, candidates := range bySessionID {
-		preferred[sessionID] = e.pickPreferredClaudeDiscoveredFile(
-			sessionID, candidates,
+	preferred := make(map[string]parser.DiscoveredFile, len(byKey))
+	for key, candidates := range byKey {
+		preferred[key] = e.pickPreferredClaudeDiscoveredFile(
+			sessionIDByKey[key], candidates,
 		)
 	}
 
@@ -3372,13 +3425,20 @@ func (e *Engine) dedupeClaudeDiscoveredFiles(
 			out = append(out, file)
 			continue
 		}
-		if _, ok := seen[sessionID]; ok {
+		key := claudeDiscoveredFileKey(file, sessionID)
+		if _, ok := seen[key]; ok {
 			continue
 		}
-		seen[sessionID] = struct{}{}
-		out = append(out, preferred[sessionID])
+		seen[key] = struct{}{}
+		out = append(out, preferred[key])
 	}
 	return out
+}
+
+func claudeDiscoveredFileKey(
+	file parser.DiscoveredFile, sessionID string,
+) string {
+	return discoveredFileIDPrefix(file) + "\x00" + sessionID
 }
 
 func claudeSessionIDFromPath(path string) string {
@@ -3397,14 +3457,18 @@ func (e *Engine) pickPreferredClaudeDiscoveredFile(
 		return candidates[0]
 	}
 
-	fullID := e.idPrefix + sessionID
+	idPrefix := e.idPrefix
+	if isS3SourcePath(candidates[0].Path) {
+		idPrefix = s3SessionIDPrefix(candidates[0].Machine)
+	}
+	fullID := applyIDPrefixToID(idPrefix, sessionID)
 	storedPath := e.db.GetSessionFilePath(fullID)
 	if storedPath != "" {
 		for _, candidate := range candidates {
 			if e.effectiveSourcePath(candidate.Path) != storedPath {
 				continue
 			}
-			if e.claudeSourceMatchesStored(fullID, candidate.Path) {
+			if e.claudeSourceMatchesStored(fullID, candidate) {
 				best := candidate
 				for _, competing := range candidates {
 					if e.effectiveSourcePath(competing.Path) == storedPath ||
@@ -3430,19 +3494,24 @@ func (e *Engine) pickPreferredClaudeDiscoveredFile(
 }
 
 func (e *Engine) claudeSourceMatchesStored(
-	sessionID, path string,
+	sessionID string, file parser.DiscoveredFile,
 ) bool {
-	info, err := os.Stat(path)
-	if err != nil {
+	size, mtime, ok := claudeDiscoveredFileSourceInfo(file)
+	if !ok {
 		return false
 	}
 	storedSize, storedMtime, ok := e.db.GetSessionFileInfo(sessionID)
 	if !ok {
 		return false
 	}
-	if storedSize != info.Size() ||
-		storedMtime != info.ModTime().UnixNano() {
+	if storedSize != size || storedMtime != mtime {
 		return false
+	}
+	if file.SourceFingerprint != "" {
+		storedHash, ok := e.db.GetSessionFileHash(sessionID)
+		if !ok || storedHash != file.SourceFingerprint {
+			return false
+		}
 	}
 	return e.db.GetSessionDataVersion(sessionID) >= db.CurrentDataVersion()
 }
@@ -3457,33 +3526,53 @@ func (e *Engine) effectiveSourcePath(path string) string {
 func claudeCandidateHasAppendProgress(
 	candidate, current parser.DiscoveredFile,
 ) bool {
-	candidateInfo, candidateErr := os.Stat(candidate.Path)
-	currentInfo, currentErr := os.Stat(current.Path)
-	if candidateErr != nil || currentErr != nil {
+	candidateSize, _, candidateOK := claudeDiscoveredFileSourceInfo(candidate)
+	currentSize, _, currentOK := claudeDiscoveredFileSourceInfo(current)
+	if !candidateOK || !currentOK {
 		return false
 	}
-	return candidateInfo.Size() > currentInfo.Size()
+	return candidateSize > currentSize
 }
 
 func preferClaudeDiscoveredFile(
 	candidate, current parser.DiscoveredFile,
 ) bool {
-	candidateInfo, candidateErr := os.Stat(candidate.Path)
-	currentInfo, currentErr := os.Stat(current.Path)
+	candidateSize, candidateMtime, candidateOK := claudeDiscoveredFileSourceInfo(candidate)
+	currentSize, currentMtime, currentOK := claudeDiscoveredFileSourceInfo(current)
 	switch {
-	case candidateErr == nil && currentErr != nil:
+	case candidateOK && !currentOK:
 		return true
-	case candidateErr != nil && currentErr == nil:
+	case !candidateOK && currentOK:
 		return false
-	case candidateErr == nil && currentErr == nil:
-		if candidateInfo.Size() != currentInfo.Size() {
-			return candidateInfo.Size() > currentInfo.Size()
+	case candidateOK && currentOK:
+		if candidateSize != currentSize {
+			return candidateSize > currentSize
 		}
-		if !candidateInfo.ModTime().Equal(currentInfo.ModTime()) {
-			return candidateInfo.ModTime().After(currentInfo.ModTime())
+		if candidateMtime != currentMtime {
+			return candidateMtime > currentMtime
 		}
 	}
 	return candidate.Path < current.Path
+}
+
+func claudeDiscoveredFileSourceInfo(
+	file parser.DiscoveredFile,
+) (size, mtime int64, ok bool) {
+	if isS3SourcePath(file.Path) {
+		if file.SourceMtime != 0 {
+			return file.SourceSize, file.SourceMtime, true
+		}
+		obj, err := statClaudeS3Session(file.Path)
+		if err != nil {
+			return 0, 0, false
+		}
+		return obj.Size, obj.LastModified.UnixNano(), true
+	}
+	info, err := os.Stat(file.Path)
+	if err != nil {
+		return 0, 0, false
+	}
+	return info.Size(), info.ModTime().UnixNano(), true
 }
 
 // zedDBCompositeMtime returns the maximum mtime across the Zed
@@ -3998,7 +4087,9 @@ func (e *Engine) collectAndBatch(
 			}
 			stats.RecordFailed()
 			if r.cacheSkip && r.mtime != 0 && !r.noCacheSkip {
-				e.cacheSkip(r.path, r.mtime)
+				e.cacheSkip(
+					r.path, r.mtime, r.sourceFingerprint,
+				)
 			}
 			log.Printf("sync error: %v", r.err)
 			continue
@@ -4031,7 +4122,9 @@ func (e *Engine) collectAndBatch(
 				stats.parserExcludedFiles++
 			}
 			if r.cacheSkip {
-				e.cacheSkip(r.path, r.mtime)
+				e.cacheSkip(
+					r.path, r.mtime, r.sourceFingerprint,
+				)
 			}
 			progress.SessionsDone++
 			e.reportProgress(onProgress, progress)
@@ -4156,6 +4249,10 @@ type processResult struct {
 	err         error
 	incremental *incrementalUpdate
 	cacheSkip   bool
+	// sourceFingerprint carries S3 object fingerprints into
+	// skip-cache writes so same-mtime object rewrites do not stay
+	// hidden behind a cached parse failure or non-interactive result.
+	sourceFingerprint string
 	// noCacheSkip suppresses skip-cache recording for an errored
 	// result even when cacheSkip is set for the agent. Read/scan
 	// failures are transient: a permission or readability fix may
@@ -4177,7 +4274,6 @@ func (e *Engine) processFile(
 	ctx context.Context,
 	file parser.DiscoveredFile,
 ) processResult {
-
 	var info os.FileInfo
 	var err error
 	switch file.Agent {
@@ -4188,6 +4284,23 @@ func (e *Engine) processFile(
 		// the main .db, so skip checks need the composite stat.
 		info, err = parser.AntigravityFileInfo(file.Path)
 	default:
+		if strings.HasPrefix(file.Path, "s3://") {
+			if file.SourceMtime == 0 {
+				obj, err := statS3SourceObject(file)
+				if err != nil {
+					return processResult{
+						err: fmt.Errorf(
+							"stat %s: %w", file.Path, err,
+						),
+					}
+				}
+				file.SourceSize = obj.Size
+				file.SourceMtime = obj.LastModified.UnixNano()
+				file.SourceFingerprint = obj.Fingerprint
+			}
+			info, err = s3SourceFileInfo(file)
+			break
+		}
 		statPath := file.Path
 		if dbPath, _, ok := parser.ParseKiroSQLiteVirtualPath(file.Path); ok {
 			statPath = dbPath
@@ -4239,6 +4352,10 @@ func (e *Engine) processFile(
 		mtime = reasonixEffectiveInfo(file.Path, info).ModTime().UnixNano()
 	}
 	cacheSkip := e.shouldCacheSkip(file)
+	sourceFingerprint := ""
+	if isS3SourcePath(file.Path) {
+		sourceFingerprint = s3SourceFingerprint(file)
+	}
 
 	// Skip files cached from a previous sync (parse errors
 	// or non-interactive sessions) whose mtime is unchanged.
@@ -4248,10 +4365,7 @@ func (e *Engine) processFile(
 	// the skip cache as authoritative without per-file
 	// re-validation.
 	if cacheSkip && !e.forceParse { // parse-diff: ignore the skip cache
-		e.skipMu.RLock()
-		cachedMtime, cached := e.skipCache[file.Path]
-		e.skipMu.RUnlock()
-		if cached && cachedMtime == mtime {
+		if e.shouldUseCachedSkip(file, mtime, sourceFingerprint) {
 			if e.pathNeedsProjectReparse(file.Path) {
 				e.clearSkip(file.Path)
 			} else {
@@ -4267,11 +4381,19 @@ func (e *Engine) processFile(
 	var res processResult
 	switch file.Agent {
 	case parser.AgentClaude:
-		res = e.processClaude(ctx, file, info)
+		if strings.HasPrefix(file.Path, "s3://") {
+			res = e.processS3Session(ctx, file, info)
+		} else {
+			res = e.processClaude(ctx, file, info)
+		}
 	case parser.AgentCowork:
 		res = e.processCowork(file, info)
 	case parser.AgentCodex:
-		res = e.processCodex(file, info)
+		if strings.HasPrefix(file.Path, "s3://") {
+			res = e.processS3Session(ctx, file, info)
+		} else {
+			res = e.processCodex(file, info)
+		}
 	case parser.AgentCopilot:
 		res = e.processCopilot(file, info)
 	case parser.AgentReasonix:
@@ -4345,7 +4467,27 @@ func (e *Engine) processFile(
 	}
 	res.cacheSkip = cacheSkip
 	res.mtime = mtime
+	res.sourceFingerprint = sourceFingerprint
 	return res
+}
+
+func (e *Engine) shouldUseCachedSkip(
+	file parser.DiscoveredFile, mtime int64, sourceFingerprint string,
+) bool {
+	e.skipMu.RLock()
+	cachedMtime, cached := e.skipCache[file.Path]
+	cachedFingerprint := ""
+	if e.skipFingerprints != nil {
+		cachedFingerprint = e.skipFingerprints[file.Path]
+	}
+	e.skipMu.RUnlock()
+	if !cached || cachedMtime != mtime {
+		return false
+	}
+	if isS3SourcePath(file.Path) && sourceFingerprint != "" {
+		return cachedFingerprint == sourceFingerprint
+	}
+	return true
 }
 
 func (e *Engine) pathNeedsProjectReparse(path string) bool {
@@ -4440,9 +4582,21 @@ func (e *Engine) shouldCacheSkip(
 
 // cacheSkip records a file so it won't be retried until
 // its mtime changes.
-func (e *Engine) cacheSkip(path string, mtime int64) {
+func (e *Engine) cacheSkip(path string, mtime int64, sourceFingerprint ...string) {
 	e.skipMu.Lock()
 	e.skipCache[path] = mtime
+	fingerprint := ""
+	if len(sourceFingerprint) > 0 {
+		fingerprint = sourceFingerprint[0]
+	}
+	if fingerprint != "" {
+		if e.skipFingerprints == nil {
+			e.skipFingerprints = make(map[string]string)
+		}
+		e.skipFingerprints[path] = fingerprint
+	} else if e.skipFingerprints != nil {
+		delete(e.skipFingerprints, path)
+	}
 	e.skipMu.Unlock()
 }
 
@@ -4451,6 +4605,7 @@ func (e *Engine) cacheSkip(path string, mtime int64) {
 func (e *Engine) clearSkip(path string) {
 	e.skipMu.Lock()
 	delete(e.skipCache, path)
+	delete(e.skipFingerprints, path)
 	e.skipMu.Unlock()
 	_ = e.db.DeleteSkippedFile(path)
 }
@@ -4496,30 +4651,12 @@ func (e *Engine) persistSkipCache() int {
 // match what is already stored in the database (by session ID).
 // This relies on mtime changing on any write, which holds for
 // append-only session files under normal filesystem behavior.
-// The file hash is still computed and stored on successful sync
-// for integrity; mtime is purely a skip-check optimization.
+// S3 callers pass an object fingerprint to guard same-size,
+// same-timestamp rewrites on object stores with coarse mtimes.
 func (e *Engine) shouldSkipFile(
 	sessionID string, info os.FileInfo,
 ) bool {
-	if e.forceParse { // parse-diff: always re-parse
-		return false
-	}
-	fullID := e.idPrefix + sessionID
-	storedSize, storedMtime, ok := e.db.GetSessionFileInfo(
-		fullID,
-	)
-	if !ok {
-		return false
-	}
-	if storedSize != info.Size() ||
-		storedMtime != info.ModTime().UnixNano() {
-		return false
-	}
-	if e.db.GetSessionDataVersion(fullID) <
-		db.CurrentDataVersion() {
-		return false
-	}
-	return true
+	return e.shouldSkipFileWithPrefix(e.idPrefix, sessionID, info)
 }
 
 // shouldSkipByPath checks file size and mtime against what is
@@ -4556,11 +4693,12 @@ func (e *Engine) shouldSkipByPath(
 // (nanoseconds) as os.FileInfo so that shouldSkipByPath can
 // be reused for OpenHands snapshot-based skip detection.
 type fakeSnapshotInfo struct {
+	fName  string
 	fSize  int64
 	fMtime int64
 }
 
-func (f fakeSnapshotInfo) Name() string      { return "" }
+func (f fakeSnapshotInfo) Name() string      { return f.fName }
 func (f fakeSnapshotInfo) Size() int64       { return f.fSize }
 func (f fakeSnapshotInfo) Mode() os.FileMode { return 0 }
 func (f fakeSnapshotInfo) ModTime() time.Time {
@@ -4573,10 +4711,17 @@ func (e *Engine) processClaude(
 	ctx context.Context,
 	file parser.DiscoveredFile, info os.FileInfo,
 ) processResult {
+	return e.processClaudeWithStoredSkip(ctx, file, info, true)
+}
 
+func (e *Engine) processClaudeWithStoredSkip(
+	ctx context.Context,
+	file parser.DiscoveredFile, info os.FileInfo,
+	allowStoredSkip bool,
+) processResult {
 	sessionID := strings.TrimSuffix(info.Name(), ".jsonl")
 
-	if e.shouldSkipFile(sessionID, info) {
+	if allowStoredSkip && e.shouldSkipFile(sessionID, info) {
 		sess, _ := e.db.GetSession(
 			ctx, e.idPrefix+sessionID,
 		)
@@ -4614,8 +4759,12 @@ func (e *Engine) processClaude(
 		}
 	}
 
+	machine := e.machine
+	if file.Machine != "" {
+		machine = file.Machine // s3 source machine overrides the host
+	}
 	results, excludedIDs, err := parser.ParseClaudeSessionWithExclusions(
-		file.Path, project, e.machine,
+		file.Path, project, machine,
 	)
 	if err != nil {
 		return processResult{err: err}
@@ -5002,11 +5151,9 @@ func (e *Engine) codexIndexSessionNameChanged(path string) bool {
 	if err != nil || stored == nil {
 		return true
 	}
-	storedName := ""
-	if stored.SessionName != nil {
-		storedName = strings.TrimSpace(*stored.SessionName)
-	}
-	return currentName != storedName
+	return e.codexStoredNameDiffersBySession(
+		stored, currentName,
+	)
 }
 
 // classifyCodexIndexPath maps a Codex session_index.jsonl change to the
@@ -5066,12 +5213,25 @@ func (e *Engine) classifyCodexIndexPath(
 // a brand-new session is synced through its own transcript event, not the
 // index, so the index path only refreshes renames of already-synced sessions.
 func (e *Engine) codexStoredNameDiffers(uuid, indexTitle string) bool {
-	stored, err := e.db.GetSessionFull(
-		context.Background(), e.idPrefix+"codex:"+uuid,
+	return e.codexStoredNameDiffersBySessionID(
+		e.idPrefix+"codex:"+uuid, indexTitle, false,
 	)
+}
+
+func (e *Engine) codexStoredNameDiffersBySessionID(
+	sessionID, indexTitle string,
+	missingDiffers bool,
+) bool {
+	stored, err := e.db.GetSessionFull(context.Background(), sessionID)
 	if err != nil || stored == nil {
-		return false
+		return missingDiffers
 	}
+	return e.codexStoredNameDiffersBySession(stored, indexTitle)
+}
+
+func (e *Engine) codexStoredNameDiffersBySession(
+	stored *db.Session, indexTitle string,
+) bool {
 	storedName := ""
 	if stored.SessionName != nil {
 		storedName = strings.TrimSpace(*stored.SessionName)
@@ -5088,8 +5248,15 @@ func pickPreferredCodexDiscoveredFile(
 	if id := parser.CodexSessionUUIDFromFilename(
 		filepath.Base(candidates[0].Path),
 	); id != "" {
-		storedPath := filepath.Clean(database.GetSessionFilePath("codex:" + id))
-		if storedPath != "" {
+		sessionID := "codex:" + id
+		for _, candidate := range candidates {
+			storedPath := database.GetSessionFilePath(applyIDPrefixToID(
+				discoveredFileIDPrefix(candidate), sessionID,
+			))
+			if storedPath == "" {
+				continue
+			}
+			storedPath = filepath.Clean(storedPath)
 			for _, candidate := range candidates {
 				if filepath.Clean(candidate.Path) == storedPath {
 					return candidate
@@ -5150,8 +5317,12 @@ func (e *Engine) processCodex(
 		forceReplace = res.forceReplace
 	}
 
+	codexMachine := e.machine
+	if file.Machine != "" {
+		codexMachine = file.Machine // s3 source machine overrides the host
+	}
 	sess, msgs, err := parser.ParseCodexSession(
-		file.Path, e.machine, false,
+		file.Path, codexMachine, false,
 	)
 	if err != nil {
 		return processResult{err: err}
@@ -7070,6 +7241,7 @@ func (e *Engine) writeBatch(
 					e.cacheSkip(
 						pw.sess.File.Path,
 						pw.sess.File.Mtime,
+						pw.sess.File.Hash,
 					)
 				}
 				continue
@@ -7883,8 +8055,9 @@ func countToolResultContentLength(calls []db.ToolCall) int {
 }
 
 type batchSourceFile struct {
-	path  string
-	mtime int64
+	path        string
+	mtime       int64
+	fingerprint string
 }
 
 func (e *Engine) writeBatchBulk(
@@ -7920,8 +8093,9 @@ func (e *Engine) writeBatchBulk(
 		})
 		if pw.sess.File.Path != "" {
 			sources[s.ID] = batchSourceFile{
-				path:  pw.sess.File.Path,
-				mtime: pw.sess.File.Mtime,
+				path:        pw.sess.File.Path,
+				mtime:       pw.sess.File.Mtime,
+				fingerprint: pw.sess.File.Hash,
 			}
 		}
 	}
@@ -7941,7 +8115,9 @@ func (e *Engine) writeBatchBulk(
 	}
 	for _, id := range result.ExcludedIDs {
 		if source, ok := sources[id]; ok && source.path != "" {
-			e.cacheSkip(source.path, source.mtime)
+			e.cacheSkip(
+				source.path, source.mtime, source.fingerprint,
+			)
 		}
 	}
 	for _, err := range result.Errors {
@@ -8125,7 +8301,11 @@ func (e *Engine) writeSessionFullWithResolver(
 	if err := e.db.UpsertSession(s); err != nil {
 		if isIntentionalSessionSkip(err) {
 			if pw.sess.File.Path != "" {
-				e.cacheSkip(pw.sess.File.Path, pw.sess.File.Mtime)
+				e.cacheSkip(
+					pw.sess.File.Path,
+					pw.sess.File.Mtime,
+					pw.sess.File.Hash,
+				)
 			}
 			return err
 		}
@@ -8476,18 +8656,7 @@ func countToolResultEvents(calls []db.ToolCall) int {
 }
 
 func (e *Engine) applyIDPrefixToSessionIDs(ids []string) []string {
-	if e.idPrefix == "" || len(ids) == 0 {
-		return ids
-	}
-	prefixed := make([]string, len(ids))
-	for i, id := range ids {
-		if id == "" || strings.HasPrefix(id, e.idPrefix) {
-			prefixed[i] = id
-			continue
-		}
-		prefixed[i] = e.idPrefix + id
-	}
-	return prefixed
+	return applyIDPrefixToIDs(e.idPrefix, ids)
 }
 
 // applyRemoteRewrites prefixes session IDs and rewrites
@@ -8498,9 +8667,9 @@ func (e *Engine) applyRemoteRewrites(
 	if e.idPrefix == "" {
 		return
 	}
-	s.ID = e.idPrefix + s.ID
+	s.ID = applyIDPrefixToID(e.idPrefix, s.ID)
 	if s.ParentSessionID != nil && *s.ParentSessionID != "" {
-		p := e.idPrefix + *s.ParentSessionID
+		p := applyIDPrefixToID(e.idPrefix, *s.ParentSessionID)
 		s.ParentSessionID = &p
 	}
 	if e.pathRewriter != nil && s.FilePath != nil {
@@ -8513,13 +8682,19 @@ func (e *Engine) applyRemoteRewrites(
 			msgs[i].ToolCalls[j].SessionID = s.ID
 			if msgs[i].ToolCalls[j].SubagentSessionID != "" {
 				msgs[i].ToolCalls[j].SubagentSessionID =
-					e.idPrefix + msgs[i].ToolCalls[j].SubagentSessionID
+					applyIDPrefixToID(
+						e.idPrefix,
+						msgs[i].ToolCalls[j].SubagentSessionID,
+					)
 			}
 			for k := range msgs[i].ToolCalls[j].ResultEvents {
 				re := &msgs[i].ToolCalls[j].ResultEvents[k]
 				if re.SubagentSessionID != "" {
 					re.SubagentSessionID =
-						e.idPrefix + re.SubagentSessionID
+						applyIDPrefixToID(
+							e.idPrefix,
+							re.SubagentSessionID,
+						)
 				}
 			}
 		}
@@ -8700,6 +8875,9 @@ func lastParsedSourceUUID(
 func (e *Engine) FindSourceFile(sessionID string) string {
 	host, rawID := parser.StripHostPrefix(sessionID)
 	if host != "" {
+		if fp := e.db.GetSessionFilePath(sessionID); isS3SourcePath(fp) {
+			return fp
+		}
 		// Remote sessions have no local source file.
 		return ""
 	}
@@ -8774,6 +8952,11 @@ func (e *Engine) FindSourceFile(sessionID string) string {
 	// return the stored path so downstream parsing stays scoped to
 	// the requested conversation rather than the whole trace file.
 	if fp := e.db.GetSessionFilePath(sessionID); fp != "" {
+		// s3:// sources have no local file to stat; the path is itself
+		// the authoritative source and processFile fetches it directly.
+		if strings.HasPrefix(fp, "s3://") {
+			return fp
+		}
 		if historyPath, idx, ok := parser.ParseAiderVirtualPath(fp); ok {
 			// aider's stored "<historyPath>#<idx>" is positional: an
 			// inserted or removed earlier run shifts the index onto a
@@ -8803,6 +8986,30 @@ func (e *Engine) FindSourceFile(sessionID string) string {
 func (e *Engine) SourceMtime(sessionID string) int64 {
 	host, rawID := parser.StripHostPrefix(sessionID)
 	if host != "" {
+		if fp := e.db.GetSessionFilePath(sessionID); isS3SourcePath(fp) {
+			stat := statS3Object
+			if def, ok := parser.AgentByPrefix(sessionID); ok &&
+				def.Type == parser.AgentClaude {
+				stat = statClaudeS3Session
+			} else if ok && def.Type == parser.AgentCodex {
+				stat = statCodexS3Session
+			}
+			if sess, err := e.db.GetSession(
+				context.Background(), sessionID,
+			); err == nil && sess != nil {
+				switch sess.Agent {
+				case string(parser.AgentClaude):
+					stat = statClaudeS3Session
+				case string(parser.AgentCodex):
+					stat = statCodexS3Session
+				}
+			}
+			obj, err := stat(fp)
+			if err != nil {
+				return 0
+			}
+			return obj.LastModified.UnixNano()
+		}
 		return 0
 	}
 
@@ -8883,6 +9090,20 @@ func (e *Engine) SourceMtime(sessionID string) int64 {
 	path := e.FindSourceFile(sessionID)
 	if path == "" {
 		return 0
+	}
+	if isS3SourcePath(path) {
+		stat := statS3Object
+		switch def.Type {
+		case parser.AgentClaude:
+			stat = statClaudeS3Session
+		case parser.AgentCodex:
+			stat = statCodexS3Session
+		}
+		obj, err := stat(path)
+		if err != nil {
+			return 0
+		}
+		return obj.LastModified.UnixNano()
 	}
 
 	if isOpenCodeFormatStorageAgent(def.Type) {
@@ -9009,9 +9230,10 @@ func (e *Engine) SyncSingleSessionContext(
 		}
 	}()
 	defer e.syncMu.Unlock()
+	e.resetS3CodexIndexCache()
 
 	host, _ := parser.StripHostPrefix(sessionID)
-	if host != "" {
+	if host != "" && !isS3SourcePath(e.db.GetSessionFilePath(sessionID)) {
 		return fmt.Errorf(
 			"cannot sync remote session %s locally", sessionID,
 		)
@@ -9100,6 +9322,7 @@ func (e *Engine) SyncSingleSessionContext(
 		Path:  path,
 		Agent: agent,
 	}
+	e.hydrateS3DiscoveredFile(ctx, sessionID, &file)
 	if e.shouldCacheSkip(file) {
 		e.clearSkip(path)
 	}
@@ -9245,7 +9468,7 @@ func (e *Engine) SyncSingleSessionContext(
 	res := e.processFile(ctx, file)
 	if res.err != nil {
 		if res.cacheSkip && res.mtime != 0 && !res.noCacheSkip {
-			e.cacheSkip(path, res.mtime)
+			e.cacheSkip(path, res.mtime, res.sourceFingerprint)
 		}
 		return res.err
 	}
