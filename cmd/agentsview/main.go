@@ -21,10 +21,10 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/remotesync"
 	"go.kenn.io/agentsview/internal/secrets"
 	"go.kenn.io/agentsview/internal/server"
 	"go.kenn.io/agentsview/internal/signals"
-	"go.kenn.io/agentsview/internal/ssh"
 	"go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/telemetry"
 )
@@ -37,7 +37,6 @@ var (
 
 const (
 	periodicSyncInterval  = 15 * time.Minute
-	daemonIdleTimeout     = 20 * time.Minute
 	telemetryPingInterval = 24 * time.Hour
 	unwatchedPollInterval = 2 * time.Minute
 	watcherDebounce       = 500 * time.Millisecond
@@ -98,13 +97,13 @@ func runServe(cfg config.Config, opts serveOptions) {
 		fatal("invalid serve config: %v", err)
 	}
 
-	// When auth is required, ensure a token exists before publishing
-	// startup state so waiting CLI probes can authenticate the first
-	// protected /api/ping after startup completes.
+	// Remote sync archive endpoints always require bearer auth, even when
+	// general API auth is disabled. Ensure a token exists before publishing
+	// startup state so daemon probes and remote collectors share one token.
+	if err := ensureServeAuthToken(&cfg); err != nil {
+		log.Fatalf("Failed to generate auth token: %v", err)
+	}
 	if cfg.RequireAuth {
-		if err := cfg.EnsureAuthToken(); err != nil {
-			log.Fatalf("Failed to generate auth token: %v", err)
-		}
 		// A background child redirects stdout to serve.log; printing the
 		// token there would persist it to a file. The parent already
 		// printed the token to the invoking terminal, so the child stays
@@ -165,7 +164,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 		context.Background(), os.Interrupt, syscall.SIGTERM,
 	)
 	defer stop()
-	idleTracker := newDaemonIdleTracker(stop)
+	idleTracker := newDaemonIdleTracker(cfg, stop)
 
 	telemetryReporter := telemetry.NewReporterOrDisabled(telemetry.Options{
 		DataDir: cfg.DataDir,
@@ -326,11 +325,18 @@ func runServe(cfg config.Config, opts serveOptions) {
 	}
 }
 
-func newDaemonIdleTracker(stop context.CancelFunc) *server.IdleTracker {
+func ensureServeAuthToken(cfg *config.Config) error {
+	if cfg == nil || cfg.AuthToken != "" {
+		return nil
+	}
+	return cfg.EnsureAuthToken()
+}
+
+func newDaemonIdleTracker(cfg config.Config, stop context.CancelFunc) *server.IdleTracker {
 	if !runningAsBackgroundChild() {
 		return nil
 	}
-	timeout := daemonIdleTimeout
+	timeout := cfg.DaemonIdleTimeout
 	if raw := os.Getenv("AGENTSVIEW_DAEMON_IDLE_TIMEOUT"); raw != "" {
 		parsed, err := time.ParseDuration(raw)
 		if err != nil {
@@ -843,6 +849,9 @@ func printSyncProgress(p sync.Progress) {
 func formatSyncProgress(p sync.Progress) string {
 	if p.Detail != "" {
 		detail := p.Detail
+		if p.BytesDone > 0 || p.BytesTotal > 0 {
+			detail = fmt.Sprintf("%s: %s", detail, formatByteProgress(p))
+		}
 		if p.SessionsTotal > 0 {
 			detail = fmt.Sprintf(
 				"%s: %d/%d sessions (%.0f%%) · %d messages",
@@ -863,6 +872,17 @@ func formatSyncProgress(p sync.Progress) string {
 		)
 	}
 	return ""
+}
+
+func formatByteProgress(p sync.Progress) string {
+	if p.BytesTotal > 0 {
+		return fmt.Sprintf(
+			"%s/%s (%.0f%%)",
+			formatBytes(p.BytesDone), formatBytes(p.BytesTotal),
+			float64(p.BytesDone)/float64(p.BytesTotal)*100,
+		)
+	}
+	return formatBytes(p.BytesDone)
 }
 
 func startFileWatcher(
@@ -1131,9 +1151,7 @@ func startRemoteHostSync(
 ) {
 	syncFn := remoteHostSyncFunc(
 		ctx, cfg, database, engine, rh,
-		func(ctx context.Context, rs *ssh.RemoteSync) (ssh.SyncStats, error) {
-			return rs.Run(ctx)
-		},
+		runRemoteSyncTransport,
 	)
 	runRemoteHostSyncLoop(ctx, rh.Host, rh.Interval, syncFn, emitter, idleTracker, nil)
 }
@@ -1142,7 +1160,13 @@ type remoteSyncExclusiveRunner interface {
 	RunExclusive(func() error) error
 }
 
-type remoteSyncRunner func(context.Context, *ssh.RemoteSync) (ssh.SyncStats, error)
+type remoteSyncRunner func(
+	context.Context,
+	config.Config,
+	*db.DB,
+	config.RemoteHost,
+	bool,
+) (remotesync.SyncStats, error)
 
 func remoteHostSyncFunc(
 	ctx context.Context,
@@ -1156,18 +1180,10 @@ func remoteHostSyncFunc(
 		if runner == nil {
 			return 0, fmt.Errorf("scheduled remote sync missing exclusive runner")
 		}
-		var stats ssh.SyncStats
+		var stats remotesync.SyncStats
 		err := runner.RunExclusive(func() error {
-			rs := &ssh.RemoteSync{
-				Host:                    rh.Host,
-				User:                    rh.User,
-				Port:                    rh.Port,
-				Full:                    database.NeedsResync(),
-				DB:                      database,
-				BlockedResultCategories: cfg.ResultContentBlockedCategories,
-			}
 			var err error
-			stats, err = runRemote(ctx, rs)
+			stats, err = runRemote(ctx, cfg, database, rh, database.NeedsResync())
 			return err
 		})
 		return stats.SessionsSynced, err

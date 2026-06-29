@@ -19,6 +19,7 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/remotesync"
 	"go.kenn.io/agentsview/internal/ssh"
 	"go.kenn.io/agentsview/internal/sync"
 )
@@ -217,6 +218,16 @@ func (p *remoteProgressPrinter) Print(progress sync.Progress) {
 		fmt.Fprintf(p.w, "  %s\n", label)
 		return
 	}
+	if progress.BytesDone > 0 || progress.BytesTotal > 0 {
+		if p.label != label {
+			p.finishCurrent()
+			p.label = label
+			p.started = p.now()
+		}
+		p.inPlace = true
+		fmt.Fprintf(p.w, "\r  %s\x1b[K", formatSyncProgress(progress))
+		return
+	}
 	if progress.Phase == sync.PhaseSyncing && progress.SessionsTotal > 0 {
 		if p.label != label {
 			p.finishCurrent()
@@ -306,6 +317,38 @@ func runRemoteSyncOnce(
 	appCfg config.Config, database *db.DB,
 	rh config.RemoteHost, full bool,
 ) error {
+	_, err := runRemoteSyncTransport(
+		context.Background(), appCfg, database, rh, full,
+	)
+	return err
+}
+
+func runRemoteSyncTransport(
+	ctx context.Context,
+	appCfg config.Config,
+	database *db.DB,
+	rh config.RemoteHost,
+	full bool,
+) (remotesync.SyncStats, error) {
+	switch rh.Transport {
+	case "", config.RemoteTransportSSH:
+		return runSSHRemoteSync(ctx, appCfg, database, rh, full)
+	case config.RemoteTransportHTTP:
+		return runHTTPRemoteSync(ctx, appCfg, database, rh, full)
+	default:
+		return remotesync.SyncStats{}, fmt.Errorf(
+			"invalid remote transport %q", rh.Transport,
+		)
+	}
+}
+
+var runSSHRemoteSync = func(
+	ctx context.Context,
+	appCfg config.Config,
+	database *db.DB,
+	rh config.RemoteHost,
+	full bool,
+) (remotesync.SyncStats, error) {
 	rs := &ssh.RemoteSync{
 		Host:                    rh.Host,
 		User:                    rh.User,
@@ -314,8 +357,31 @@ func runRemoteSyncOnce(
 		DB:                      database,
 		BlockedResultCategories: appCfg.ResultContentBlockedCategories,
 	}
-	_, err := rs.Run(context.Background())
-	return err
+	return rs.Run(ctx)
+}
+
+var runHTTPRemoteSync = func(
+	ctx context.Context,
+	appCfg config.Config,
+	database *db.DB,
+	rh config.RemoteHost,
+	full bool,
+) (remotesync.SyncStats, error) {
+	token := rh.Token
+	if token == "" {
+		return remotesync.SyncStats{}, fmt.Errorf(
+			"http remote sync token is required for host %q",
+			rh.Host,
+		)
+	}
+	return remotesync.HTTPSync{
+		Host:                    rh.Host,
+		URL:                     rh.URL,
+		Token:                   token,
+		Full:                    full,
+		DB:                      database,
+		BlockedResultCategories: appCfg.ResultContentBlockedCategories,
+	}.Run(ctx)
 }
 
 // remoteHostFailure records a configured remote host that failed
