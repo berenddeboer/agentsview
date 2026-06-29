@@ -5,9 +5,12 @@ use std::fs;
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver as StdReceiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,6 +35,9 @@ const STATUS_PROBE_FAILURE_NOTICE_AFTER: u32 = 10;
 const LOGIN_SHELL_ENV_TIMEOUT: Duration = Duration::from_secs(3);
 const UPDATE_SIDECAR_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const DATA_VERSION_TOO_NEW_EXIT_CODE: i32 = 3;
+const DESKTOP_LOG_FILE_NAME: &str = "agentsview-desktop.log";
+const DESKTOP_LOG_QUEUE_CAPACITY: usize = 64;
+const OPEN_LOGS_FOLDER_MENU_ID: &str = "open_logs_folder";
 // Delay after navigating to the backend before probing whether the
 // Linux WebKitGTK web content process is actually alive. Gives the
 // process time to spawn so we don't false-positive on slow startup.
@@ -58,6 +64,29 @@ struct SidecarState {
 struct SidecarProcess {
     child: CommandChild,
     generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SidecarLogRecord {
+    label: &'static str,
+    record: String,
+}
+
+impl SidecarLogRecord {
+    fn new(label: &'static str, record: impl Into<String>) -> Self {
+        Self {
+            label,
+            record: record.into(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SidecarStdoutUpdate {
+    chunk: String,
+    redacted_chunk: String,
+    status: Option<String>,
+    port: Option<u16>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -131,6 +160,9 @@ pub fn run() {
                     if let Some(window) = app_handle.get_webview_window("main") {
                         let _ = window.eval("window.dispatchEvent(new CustomEvent('show-about'));");
                     }
+                }
+                if event.id().0 == OPEN_LOGS_FOLDER_MENU_ID {
+                    open_logs_folder(app_handle);
                 }
                 if event.id().0 == "check_updates" {
                     let handle = app_handle.clone();
@@ -448,7 +480,10 @@ fn merge_desktop_env_pairs(
 ) {
     for (k, v) in pairs {
         let translated = translate_desktop_env_value(v, is_windows);
-        dest.insert(normalize_env_key(k.as_os_str(), case_insensitive_keys), translated);
+        dest.insert(
+            normalize_env_key(k.as_os_str(), case_insensitive_keys),
+            translated,
+        );
     }
 }
 
@@ -459,11 +494,17 @@ fn translate_desktop_env_value(value: OsString, is_windows: bool) -> OsString {
     let Some(v) = value.to_str() else {
         return value;
     };
-    let Some((distro, unix_path)) = v.strip_prefix("wsl:").and_then(|value| value.split_once(":/"))
+    let Some((distro, unix_path)) = v
+        .strip_prefix("wsl:")
+        .and_then(|value| value.split_once(":/"))
     else {
         return value;
     };
-    if distro.is_empty() || distro.contains(':') || unix_path.is_empty() || unix_path.starts_with('/') {
+    if distro.is_empty()
+        || distro.contains(':')
+        || unix_path.is_empty()
+        || unix_path.starts_with('/')
+    {
         return value;
     }
     OsString::from(format!(r"\\wsl.localhost\{distro}\{unix_path}").replace('/', "\\"))
@@ -922,6 +963,7 @@ fn wait_for_sidecar_termination(state: &SidecarState, generation: u64, timeout: 
 fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow, generation: u64) {
     let startup_handled = Arc::new(AtomicBool::new(false));
     let first_output = Arc::new(AtomicBool::new(false));
+    let log_sender = spawn_sidecar_log_writer(window.app_handle().clone());
     let timeout_window = window.clone();
     let timeout_state = startup_handled.clone();
     thread::spawn(move || {
@@ -934,11 +976,18 @@ fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow, generation: u6
 
     tauri::async_runtime::spawn(async move {
         let mut stdout_buffer = String::new();
+        let mut stdout_log_buffer = String::new();
+        let mut stderr_log_buffer = String::new();
         while let Some(event) = rx.recv().await {
             match event {
                 CommandEvent::Stdout(chunk_bytes) => {
-                    let chunk = String::from_utf8_lossy(&chunk_bytes);
-                    eprintln!("[agentsview] {}", chunk.trim_end());
+                    let stdout_update = prepare_sidecar_stdout_update(
+                        &log_sender,
+                        &mut stdout_buffer,
+                        &mut stdout_log_buffer,
+                        &chunk_bytes,
+                    );
+                    emit_redacted_sidecar_stdout_chunk(stdout_update.redacted_chunk.as_str());
                     if !startup_handled.load(Ordering::SeqCst) {
                         if !first_output.swap(true, Ordering::SeqCst) {
                             let _ = window.eval(
@@ -946,15 +995,12 @@ fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow, generation: u6
                                  window.__setStatus('Starting database and syncing sessions...');",
                             );
                         }
-                        if let Some(status) = extract_startup_status(chunk.as_ref()) {
+                        if let Some(status) = stdout_update.status {
                             let escaped = status.replace('\\', "\\\\").replace('\'', "\\'");
                             let _ =
                                 window.eval(format!("window.__setStatus('{escaped}');").as_str());
                         }
-                        if let Some(port) = parse_listening_port_from_stdout_buffer(
-                            &mut stdout_buffer,
-                            chunk.as_ref(),
-                        ) {
+                        if let Some(port) = stdout_update.port {
                             save_sidecar_port(window.app_handle(), port);
                             startup_handled.store(true, Ordering::SeqCst);
                             let _ = window.eval(
@@ -966,10 +1012,37 @@ fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow, generation: u6
                     }
                 }
                 CommandEvent::Stderr(line_bytes) => {
-                    let line = String::from_utf8_lossy(&line_bytes);
-                    eprintln!("[agentsview:stderr] {}", line.trim_end());
+                    emit_redacted_sidecar_stderr_chunk(
+                        queue_redacted_sidecar_chunk(
+                            &log_sender,
+                            "stderr",
+                            &mut stderr_log_buffer,
+                            String::from_utf8_lossy(&line_bytes).as_ref(),
+                        )
+                        .as_str(),
+                    );
                 }
                 CommandEvent::Terminated(payload) => {
+                    emit_redacted_sidecar_stdout_chunk(
+                        flush_pending_sidecar_log_record(
+                            &log_sender,
+                            "stdout",
+                            &mut stdout_log_buffer,
+                        )
+                        .as_str(),
+                    );
+                    emit_redacted_sidecar_stderr_chunk(
+                        flush_pending_sidecar_log_record(
+                            &log_sender,
+                            "stderr",
+                            &mut stderr_log_buffer,
+                        )
+                        .as_str(),
+                    );
+                    queue_sidecar_event_log_record(
+                        &log_sender,
+                        &CommandEvent::Terminated(payload.clone()),
+                    );
                     eprintln!(
                         "[agentsview] sidecar terminated (code: {:?}, signal: {:?})",
                         payload.code, payload.signal
@@ -1004,11 +1077,20 @@ fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow, generation: u6
                     break;
                 }
                 CommandEvent::Error(err) => {
+                    queue_sidecar_event_log_record(&log_sender, &CommandEvent::Error(err.clone()));
                     eprintln!("[agentsview:error] {err}");
                 }
                 _ => {}
             }
         }
+        emit_redacted_sidecar_stdout_chunk(
+            flush_pending_sidecar_log_record(&log_sender, "stdout", &mut stdout_log_buffer)
+                .as_str(),
+        );
+        emit_redacted_sidecar_stderr_chunk(
+            flush_pending_sidecar_log_record(&log_sender, "stderr", &mut stderr_log_buffer)
+                .as_str(),
+        );
     });
 }
 
@@ -1410,12 +1492,15 @@ fn parse_writable_listening_port_from_status(buffer: &str) -> Option<u16> {
 
 fn setup_menu(app: &mut App) -> Result<(), DynError> {
     let about = MenuItemBuilder::with_id("about", "About AgentsView").build(app)?;
+    let open_logs_folder =
+        MenuItemBuilder::with_id(OPEN_LOGS_FOLDER_MENU_ID, "Open Logs Folder").build(app)?;
     let check_updates =
         MenuItemBuilder::with_id("check_updates", "Check for Updates...").build(app)?;
 
     let builder = SubmenuBuilder::new(app, "File")
         .item(&about)
         .separator()
+        .item(&open_logs_folder)
         .item(&check_updates)
         .separator();
 
@@ -1440,6 +1525,356 @@ fn setup_menu(app: &mut App) -> Result<(), DynError> {
         .build()?;
     app.set_menu(menu)?;
     Ok(())
+}
+
+fn open_logs_folder(handle: &AppHandle) {
+    let log_dir = match ensure_desktop_log_dir(handle) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("[agentsview] failed to resolve logs folder: {err}");
+            return;
+        }
+    };
+
+    if let Err(err) = handle
+        .opener()
+        .open_path(log_dir.to_string_lossy().into_owned(), None::<&str>)
+    {
+        let log_path = desktop_log_file_path(handle).ok();
+        let err_text = err.to_string();
+        let message = open_logs_folder_failure_message(&log_dir, err_text.as_str());
+        if let Some(path) = log_path {
+            if let Err(log_err) =
+                append_open_logs_folder_failure_at_path(&path, &log_dir, err_text.as_str())
+            {
+                eprintln!("[agentsview] failed to append logs-folder failure log: {log_err}");
+            }
+        }
+        eprintln!("[agentsview] {message}");
+    }
+}
+
+fn desktop_log_file_path(handle: &AppHandle) -> io::Result<PathBuf> {
+    Ok(ensure_desktop_log_dir(handle)?.join(DESKTOP_LOG_FILE_NAME))
+}
+
+fn ensure_desktop_log_dir(handle: &AppHandle) -> io::Result<PathBuf> {
+    let log_dir = handle
+        .path()
+        .app_log_dir()
+        .map_err(|err| io::Error::other(err.to_string()))?;
+    fs::create_dir_all(&log_dir)?;
+    tighten_desktop_log_dir_permissions(&log_dir)?;
+    Ok(log_dir)
+}
+
+fn spawn_sidecar_log_writer(handle: AppHandle) -> SyncSender<SidecarLogRecord> {
+    let (log_sender, log_receiver) = sync_channel(DESKTOP_LOG_QUEUE_CAPACITY);
+    thread::spawn(move || drain_sidecar_log_records(handle, log_receiver));
+    log_sender
+}
+
+fn drain_sidecar_log_records(handle: AppHandle, log_receiver: StdReceiver<SidecarLogRecord>) {
+    while let Ok(record) = log_receiver.recv() {
+        let path = match desktop_log_file_path(&handle) {
+            Ok(path) => path,
+            Err(err) => {
+                eprintln!("[agentsview] failed to resolve sidecar event log path: {err}");
+                continue;
+            }
+        };
+        if let Err(err) =
+            append_sidecar_log_record_at_path(&path, record.label, record.record.as_str())
+        {
+            eprintln!("[agentsview] failed to append sidecar event log: {err}");
+        }
+    }
+}
+
+fn prepare_sidecar_stdout_update(
+    log_sender: &SyncSender<SidecarLogRecord>,
+    stdout_buffer: &mut String,
+    stdout_log_buffer: &mut String,
+    chunk_bytes: &[u8],
+) -> SidecarStdoutUpdate {
+    let chunk = String::from_utf8_lossy(chunk_bytes).into_owned();
+    let redacted_chunk =
+        queue_redacted_sidecar_chunk(log_sender, "stdout", stdout_log_buffer, chunk.as_str());
+    SidecarStdoutUpdate {
+        status: extract_startup_status(chunk.as_ref()),
+        port: parse_listening_port_from_stdout_buffer(stdout_buffer, chunk.as_ref()),
+        chunk,
+        redacted_chunk,
+    }
+}
+
+fn emit_redacted_sidecar_stdout_chunk(redacted_chunk: &str) {
+    emit_sidecar_console_chunk("agentsview", redacted_chunk);
+}
+
+fn emit_redacted_sidecar_stderr_chunk(redacted_chunk: &str) {
+    emit_sidecar_console_chunk("agentsview:stderr", redacted_chunk);
+}
+
+fn emit_sidecar_console_chunk(prefix: &str, redacted_chunk: &str) {
+    for line in redacted_chunk.lines().filter(|line| !line.is_empty()) {
+        eprintln!("[{prefix}] {line}");
+    }
+}
+
+fn queue_redacted_sidecar_chunk(
+    log_sender: &SyncSender<SidecarLogRecord>,
+    label: &'static str,
+    log_buffer: &mut String,
+    chunk: &str,
+) -> String {
+    let redacted_chunk = drain_redacted_sidecar_log_lines(log_buffer, chunk);
+    if !redacted_chunk.trim().is_empty() {
+        try_send_sidecar_log_record(
+            log_sender,
+            SidecarLogRecord::new(label, redacted_chunk.clone()),
+        );
+    }
+    redacted_chunk
+}
+
+fn drain_redacted_sidecar_log_lines(log_buffer: &mut String, chunk: &str) -> String {
+    log_buffer.push_str(chunk);
+
+    let mut redacted_lines = Vec::new();
+    let mut consumed = 0;
+    let mut chars = log_buffer.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if ch != '\r' && ch != '\n' {
+            continue;
+        }
+        let line = &log_buffer[consumed..idx];
+        if !line.is_empty() {
+            redacted_lines.push(redact_sidecar_log_line(line));
+        }
+        consumed = idx + ch.len_utf8();
+        if ch == '\r' && matches!(chars.peek(), Some((_, '\n'))) {
+            let (next_idx, next_ch) = chars.next().expect("peeked newline");
+            consumed = next_idx + next_ch.len_utf8();
+        }
+    }
+
+    if consumed > 0 {
+        log_buffer.drain(..consumed);
+    }
+
+    redacted_lines.join("\n")
+}
+
+fn flush_pending_sidecar_log_record(
+    log_sender: &SyncSender<SidecarLogRecord>,
+    label: &'static str,
+    log_buffer: &mut String,
+) -> String {
+    if log_buffer.trim().is_empty() {
+        log_buffer.clear();
+        return String::new();
+    }
+    let pending = std::mem::take(log_buffer);
+    let redacted = pending
+        .split(['\r', '\n'])
+        .filter(|line| !line.is_empty())
+        .map(redact_sidecar_log_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+    if !redacted.is_empty() {
+        try_send_sidecar_log_record(log_sender, SidecarLogRecord::new(label, redacted.clone()));
+    }
+    redacted
+}
+
+fn redact_sidecar_log_line(line: &str) -> String {
+    let mut redacted = line.to_string();
+    for prefix in [
+        "Authorization: Bearer ",
+        "authorization: Bearer ",
+        "Bearer ",
+        "bearer ",
+        "Token: ",
+        "token: ",
+        "--auth-token=",
+        "--auth-token ",
+        "auth_token=",
+        "token=",
+    ] {
+        redacted = redact_value_after_prefix(redacted, prefix);
+    }
+    redacted
+}
+
+fn redact_value_after_prefix(mut text: String, prefix: &str) -> String {
+    let mut search_from = 0;
+    while let Some(relative_start) = text[search_from..].find(prefix) {
+        let value_start = search_from + relative_start + prefix.len();
+        let value_end = value_start
+            + text[value_start..]
+                .find(is_sensitive_value_terminator)
+                .unwrap_or_else(|| text.len() - value_start);
+        if value_end > value_start {
+            text.replace_range(value_start..value_end, "<redacted>");
+            search_from = value_start + "<redacted>".len();
+        } else {
+            search_from = value_start;
+        }
+    }
+    text
+}
+
+fn is_sensitive_value_terminator(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | '&' | ')' | ']' | '}')
+}
+
+fn queue_sidecar_event_log_record(log_sender: &SyncSender<SidecarLogRecord>, event: &CommandEvent) {
+    if let Some(record) = sidecar_log_record_from_event(event) {
+        try_send_sidecar_log_record(log_sender, record);
+    }
+}
+
+fn sidecar_log_record_from_event(event: &CommandEvent) -> Option<SidecarLogRecord> {
+    match event {
+        CommandEvent::Stdout(_) => None,
+        CommandEvent::Stderr(line_bytes) => Some(SidecarLogRecord::new(
+            "stderr",
+            String::from_utf8_lossy(line_bytes)
+                .split(['\r', '\n'])
+                .filter(|line| !line.is_empty())
+                .map(redact_sidecar_log_line)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )),
+        CommandEvent::Terminated(payload) => Some(SidecarLogRecord::new(
+            "terminated",
+            format!(
+                "sidecar terminated (code: {:?}, signal: {:?})",
+                payload.code, payload.signal
+            ),
+        )),
+        CommandEvent::Error(err) => Some(SidecarLogRecord::new(
+            "error",
+            format!("sidecar command error: {err}"),
+        )),
+        _ => None,
+    }
+}
+
+fn try_send_sidecar_log_record(
+    log_sender: &SyncSender<SidecarLogRecord>,
+    record: SidecarLogRecord,
+) {
+    match log_sender.try_send(record) {
+        Ok(()) => {}
+        Err(TrySendError::Full(record)) => {
+            eprintln!(
+                "[agentsview] dropping sidecar {} log because the log queue is full",
+                record.label
+            );
+        }
+        Err(TrySendError::Disconnected(record)) => {
+            eprintln!(
+                "[agentsview] dropping sidecar {} log because the log worker is unavailable",
+                record.label
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+fn append_sidecar_event_record_at_path(path: &Path, event: &CommandEvent) -> io::Result<()> {
+    match event {
+        CommandEvent::Stdout(chunk_bytes) => append_sidecar_log_record_at_path(
+            path,
+            "stdout",
+            String::from_utf8_lossy(chunk_bytes).as_ref(),
+        ),
+        CommandEvent::Stderr(line_bytes) => append_sidecar_log_record_at_path(
+            path,
+            "stderr",
+            String::from_utf8_lossy(line_bytes).as_ref(),
+        ),
+        CommandEvent::Terminated(payload) => append_sidecar_log_record_at_path(
+            path,
+            "terminated",
+            format!(
+                "sidecar terminated (code: {:?}, signal: {:?})",
+                payload.code, payload.signal
+            )
+            .as_str(),
+        ),
+        CommandEvent::Error(err) => append_sidecar_log_record_at_path(
+            path,
+            "error",
+            format!("sidecar command error: {err}").as_str(),
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn append_sidecar_log_record_at_path(path: &Path, label: &str, record: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+        tighten_desktop_log_dir_permissions(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    tighten_desktop_log_file_permissions(&file)?;
+    write_labeled_log_record(&mut file, label, record)
+}
+
+#[cfg(unix)]
+fn tighten_desktop_log_dir_permissions(path: &Path) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn tighten_desktop_log_dir_permissions(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn tighten_desktop_log_file_permissions(file: &fs::File) -> io::Result<()> {
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn tighten_desktop_log_file_permissions(_file: &fs::File) -> io::Result<()> {
+    Ok(())
+}
+
+fn write_labeled_log_record(file: &mut fs::File, label: &str, record: &str) -> io::Result<()> {
+    let trimmed = record.trim_end_matches(['\r', '\n']);
+    if trimmed.is_empty() {
+        writeln!(file, "[{label}]")?;
+        return Ok(());
+    }
+    for line in trimmed.split(['\r', '\n']).filter(|line| !line.is_empty()) {
+        writeln!(file, "[{label}] {line}")?;
+    }
+    Ok(())
+}
+
+fn open_logs_folder_failure_message(log_dir: &Path, err: &str) -> String {
+    format!("failed to open logs folder {}: {err}", log_dir.display())
+}
+
+fn append_open_logs_folder_failure_at_path(
+    path: &Path,
+    log_dir: &Path,
+    err: &str,
+) -> io::Result<()> {
+    append_sidecar_log_record_at_path(
+        path,
+        "menu",
+        open_logs_folder_failure_message(log_dir, err).as_str(),
+    )
 }
 
 /// Restore input focus to the main webview after a native GTK dialog
@@ -2007,12 +2442,14 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use std::collections::HashMap;
+    use std::fs;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::tempdir;
 
     #[test]
     fn sidecar_args_use_cobra_long_flags() {
@@ -2197,6 +2634,357 @@ mod tests {
             parse_listening_port_from_stdout_buffer(&mut buf, "080 (started in 1.2s)\n"),
             Some(18080)
         );
+    }
+
+    #[test]
+    fn append_sidecar_log_record_writes_labeled_stdout_and_stderr_lines() {
+        let tempdir = tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("logs").join(DESKTOP_LOG_FILE_NAME);
+
+        append_sidecar_log_record_at_path(&log_path, "stdout", "booting\nlistening\n")
+            .expect("stdout log write");
+        append_sidecar_log_record_at_path(&log_path, "stderr", "fatal line\n")
+            .expect("stderr log write");
+
+        let logged = fs::read_to_string(log_path).expect("read log");
+        assert!(logged.contains("[stdout] booting"));
+        assert!(logged.contains("[stdout] listening"));
+        assert!(logged.contains("[stderr] fatal line"));
+    }
+
+    #[test]
+    fn append_sidecar_log_record_splits_carriage_return_progress_updates() {
+        let tempdir = tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("logs").join(DESKTOP_LOG_FILE_NAME);
+
+        append_sidecar_log_record_at_path(&log_path, "stdout", "syncing\rindexing\r")
+            .expect("progress log write");
+
+        let logged = fs::read_to_string(log_path).expect("read progress log");
+        assert!(logged.contains("[stdout] syncing"));
+        assert!(logged.contains("[stdout] indexing"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_sidecar_log_record_tightens_log_permissions() {
+        let tempdir = tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("logs").join(DESKTOP_LOG_FILE_NAME);
+
+        append_sidecar_log_record_at_path(&log_path, "stdout", "booting\n")
+            .expect("stdout log write");
+
+        let log_dir_mode = fs::metadata(log_path.parent().expect("log dir"))
+            .expect("read log dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let log_file_mode = fs::metadata(&log_path)
+            .expect("read log file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(log_dir_mode, 0o700);
+        assert_eq!(log_file_mode, 0o600);
+    }
+
+    #[test]
+    fn append_sidecar_log_record_returns_error_when_log_dir_is_not_directory() {
+        let tempdir = tempdir().expect("tempdir");
+        let blocked_parent = tempdir.path().join("blocked");
+        fs::write(&blocked_parent, "not a directory").expect("write blocker");
+        let log_path = blocked_parent.join(DESKTOP_LOG_FILE_NAME);
+
+        let err = append_sidecar_log_record_at_path(&log_path, "stdout", "booting")
+            .expect_err("append should fail");
+
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn append_sidecar_event_record_writes_logged_event_variants() {
+        let tempdir = tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("logs").join(DESKTOP_LOG_FILE_NAME);
+
+        append_sidecar_event_record_at_path(
+            &log_path,
+            &CommandEvent::Stdout(b"booting\n".to_vec()),
+        )
+        .expect("stdout event log write");
+        append_sidecar_event_record_at_path(
+            &log_path,
+            &CommandEvent::Stderr(b"fatal line\n".to_vec()),
+        )
+        .expect("stderr event log write");
+        append_sidecar_event_record_at_path(
+            &log_path,
+            &CommandEvent::Terminated(tauri_plugin_shell::process::TerminatedPayload {
+                code: Some(23),
+                signal: None,
+            }),
+        )
+        .expect("terminated event log write");
+        append_sidecar_event_record_at_path(
+            &log_path,
+            &CommandEvent::Error("spawn failed".to_string()),
+        )
+        .expect("error event log write");
+
+        let logged = fs::read_to_string(log_path).expect("read log");
+        assert!(logged.contains("[stdout] booting"));
+        assert!(logged.contains("[stderr] fatal line"));
+        assert!(logged.contains("[terminated] sidecar terminated (code: Some(23), signal: None)"));
+        assert!(logged.contains("[error] sidecar command error: spawn failed"));
+    }
+
+    #[test]
+    fn append_open_logs_folder_failure_writes_menu_log_entry() {
+        let tempdir = tempdir().expect("tempdir");
+        let log_dir = tempdir.path().join("logs");
+        let log_path = log_dir.join(DESKTOP_LOG_FILE_NAME);
+
+        append_open_logs_folder_failure_at_path(&log_path, &log_dir, "not allowed")
+            .expect("menu failure log write");
+
+        let logged = fs::read_to_string(log_path).expect("read menu log");
+        assert!(logged.contains("[menu] failed to open logs folder"));
+        assert!(logged.contains(log_dir.display().to_string().as_str()));
+        assert!(logged.contains("not allowed"));
+    }
+
+    #[test]
+    fn prepare_sidecar_stdout_update_enqueues_log_and_keeps_port_detection() {
+        let (log_sender, log_receiver) = sync_channel(1);
+        let mut stdout_buffer = String::new();
+        let mut stdout_log_buffer = String::new();
+
+        let stdout_update = prepare_sidecar_stdout_update(
+            &log_sender,
+            &mut stdout_buffer,
+            &mut stdout_log_buffer,
+            b"agentsview dev listening at http://127.0.0.1:18080 (started in 1.2s)\n",
+        );
+
+        assert_eq!(stdout_update.port, Some(18080));
+        let logged = log_receiver.try_recv().expect("stdout record");
+        assert_eq!(logged.label, "stdout");
+        assert!(logged
+            .record
+            .contains("agentsview dev listening at http://127.0.0.1:18080"));
+    }
+
+    #[test]
+    fn prepare_sidecar_stdout_update_redacts_token_bearing_lines() {
+        let (log_sender, log_receiver) = sync_channel(1);
+        let mut stdout_buffer = String::new();
+        let mut stdout_log_buffer = String::new();
+
+        let stdout_update = prepare_sidecar_stdout_update(
+            &log_sender,
+            &mut stdout_buffer,
+            &mut stdout_log_buffer,
+            b"Authorization: Bearer secret-token\nAuth enabled. Token: startup-secret\n--auth-token=another-secret\n",
+        );
+
+        let logged = log_receiver.try_recv().expect("stdout record");
+        assert_eq!(logged.label, "stdout");
+        assert!(stdout_update
+            .redacted_chunk
+            .contains("Authorization: Bearer <redacted>"));
+        assert!(stdout_update
+            .redacted_chunk
+            .contains("Auth enabled. Token: <redacted>"));
+        assert!(stdout_update
+            .redacted_chunk
+            .contains("--auth-token=<redacted>"));
+        assert!(!stdout_update.redacted_chunk.contains("secret-token"));
+        assert!(!stdout_update.redacted_chunk.contains("startup-secret"));
+        assert!(!stdout_update.redacted_chunk.contains("another-secret"));
+        assert!(logged.record.contains("Authorization: Bearer <redacted>"));
+        assert!(logged.record.contains("Auth enabled. Token: <redacted>"));
+        assert!(logged.record.contains("--auth-token=<redacted>"));
+        assert!(!logged.record.contains("secret-token"));
+        assert!(!logged.record.contains("startup-secret"));
+        assert!(!logged.record.contains("another-secret"));
+    }
+
+    #[test]
+    fn prepare_sidecar_stdout_update_redacts_split_token_lines_after_newline() {
+        let (log_sender, log_receiver) = sync_channel(1);
+        let mut stdout_buffer = String::new();
+        let mut stdout_log_buffer = String::new();
+
+        let first_update = prepare_sidecar_stdout_update(
+            &log_sender,
+            &mut stdout_buffer,
+            &mut stdout_log_buffer,
+            b"Auth enabled. Token: ",
+        );
+        assert!(first_update.redacted_chunk.is_empty());
+        assert!(log_receiver.try_recv().is_err());
+
+        let second_update = prepare_sidecar_stdout_update(
+            &log_sender,
+            &mut stdout_buffer,
+            &mut stdout_log_buffer,
+            b"split-secret\n",
+        );
+
+        let logged = log_receiver.try_recv().expect("stdout record");
+        assert_eq!(logged.label, "stdout");
+        assert!(second_update
+            .redacted_chunk
+            .contains("Auth enabled. Token: <redacted>"));
+        assert!(!second_update.redacted_chunk.contains("split-secret"));
+        assert!(logged.record.contains("Auth enabled. Token: <redacted>"));
+        assert!(!logged.record.contains("split-secret"));
+    }
+
+    #[test]
+    fn flush_pending_sidecar_stdout_log_record_redacts_split_token_tail() {
+        let (log_sender, log_receiver) = sync_channel(1);
+        let mut stdout_buffer = String::new();
+        let mut stdout_log_buffer = String::new();
+
+        prepare_sidecar_stdout_update(
+            &log_sender,
+            &mut stdout_buffer,
+            &mut stdout_log_buffer,
+            b"Auth enabled. Token: split-secret",
+        );
+        assert!(log_receiver.try_recv().is_err());
+
+        let flushed =
+            flush_pending_sidecar_log_record(&log_sender, "stdout", &mut stdout_log_buffer);
+
+        let logged = log_receiver.try_recv().expect("stdout record");
+        assert_eq!(logged.label, "stdout");
+        assert!(flushed.contains("Auth enabled. Token: <redacted>"));
+        assert!(!flushed.contains("split-secret"));
+        assert!(logged.record.contains("Auth enabled. Token: <redacted>"));
+        assert!(!logged.record.contains("split-secret"));
+    }
+
+    #[test]
+    fn queue_redacted_sidecar_stderr_chunk_redacts_split_token_lines_after_newline() {
+        let (log_sender, log_receiver) = sync_channel(1);
+        let mut stderr_log_buffer = String::new();
+
+        let first_chunk = queue_redacted_sidecar_chunk(
+            &log_sender,
+            "stderr",
+            &mut stderr_log_buffer,
+            "Authorization: Bearer ",
+        );
+        assert!(first_chunk.is_empty());
+        assert!(log_receiver.try_recv().is_err());
+
+        let second_chunk = queue_redacted_sidecar_chunk(
+            &log_sender,
+            "stderr",
+            &mut stderr_log_buffer,
+            "stderr-secret\n",
+        );
+
+        let logged = log_receiver.try_recv().expect("stderr record");
+        assert_eq!(logged.label, "stderr");
+        assert!(second_chunk.contains("Authorization: Bearer <redacted>"));
+        assert!(!second_chunk.contains("stderr-secret"));
+        assert!(logged.record.contains("Authorization: Bearer <redacted>"));
+        assert!(!logged.record.contains("stderr-secret"));
+    }
+
+    #[test]
+    fn flush_pending_sidecar_stderr_log_record_redacts_split_token_tail() {
+        let (log_sender, log_receiver) = sync_channel(1);
+        let mut stderr_log_buffer = String::new();
+
+        queue_redacted_sidecar_chunk(
+            &log_sender,
+            "stderr",
+            &mut stderr_log_buffer,
+            "Auth enabled. Token: stderr-tail",
+        );
+        assert!(log_receiver.try_recv().is_err());
+
+        let flushed =
+            flush_pending_sidecar_log_record(&log_sender, "stderr", &mut stderr_log_buffer);
+
+        let logged = log_receiver.try_recv().expect("stderr record");
+        assert_eq!(logged.label, "stderr");
+        assert!(flushed.contains("Auth enabled. Token: <redacted>"));
+        assert!(!flushed.contains("stderr-tail"));
+        assert!(logged.record.contains("Auth enabled. Token: <redacted>"));
+        assert!(!logged.record.contains("stderr-tail"));
+    }
+
+    #[test]
+    fn sidecar_log_record_from_event_redacts_stderr_token_lines() {
+        let record = sidecar_log_record_from_event(&CommandEvent::Stderr(
+            b"Authorization: Bearer stderr-secret\n".to_vec(),
+        ))
+        .expect("stderr record");
+
+        assert_eq!(record.label, "stderr");
+        assert!(record.record.contains("Authorization: Bearer <redacted>"));
+        assert!(!record.record.contains("stderr-secret"));
+    }
+
+    #[test]
+    fn prepare_sidecar_stdout_update_keeps_parsing_when_log_queue_is_full() {
+        let (log_sender, log_receiver) = sync_channel(1);
+        log_sender
+            .send(SidecarLogRecord::new("stdout", "already queued"))
+            .expect("fill queue");
+        let mut stdout_buffer = String::new();
+        let mut stdout_log_buffer = String::new();
+
+        let stdout_update = prepare_sidecar_stdout_update(
+            &log_sender,
+            &mut stdout_buffer,
+            &mut stdout_log_buffer,
+            b"Running initial sync...\n",
+        );
+
+        assert_eq!(
+            stdout_update.status,
+            Some("Running initial sync...".to_string())
+        );
+        let retained = log_receiver.try_recv().expect("queued record");
+        assert_eq!(retained.record, "already queued");
+    }
+
+    #[test]
+    fn forward_sidecar_logs_stdout_path_keeps_status_and_port_parsing() {
+        let source = include_str!("lib.rs");
+        let stdout_arm = source
+            .split("CommandEvent::Stdout(chunk_bytes) => {")
+            .nth(1)
+            .and_then(|segment| {
+                segment
+                    .split("CommandEvent::Stderr(line_bytes) => {")
+                    .next()
+            })
+            .expect("stdout arm");
+
+        assert!(stdout_arm.contains("prepare_sidecar_stdout_update("));
+        assert!(stdout_arm.contains("stdout_update.status"));
+        assert!(stdout_arm.contains("stdout_update.port"));
+        assert!(stdout_arm.contains("window.__setStage(2)"));
+        assert!(source.contains(
+            "flush_pending_sidecar_stdout_log_record(&log_sender, &mut stdout_log_buffer);"
+        ));
+    }
+
+    #[test]
+    fn file_menu_includes_open_logs_folder_action() {
+        let source = include_str!("lib.rs");
+
+        assert!(source.contains("OPEN_LOGS_FOLDER_MENU_ID"));
+        assert!(source
+            .contains("MenuItemBuilder::with_id(OPEN_LOGS_FOLDER_MENU_ID, \"Open Logs Folder\")"));
+        assert!(source.contains(".open_path(log_dir.to_string_lossy().into_owned(), None::<&str>)"));
     }
 
     #[test]
@@ -2680,7 +3468,10 @@ mode:    writable
             true,
         );
         let map: HashMap<_, _> = merged.into_iter().collect();
-        assert_eq!(map.get(&OsString::from("HOME")), Some(&OsString::from("/base")));
+        assert_eq!(
+            map.get(&OsString::from("HOME")),
+            Some(&OsString::from("/base"))
+        );
     }
 
     #[test]
@@ -2699,7 +3490,9 @@ mode:    writable
         let map: HashMap<_, _> = merged.into_iter().collect();
         assert_eq!(
             map.get(&OsString::from("CODEX_SESSIONS_DIR")),
-            Some(&OsString::from(r"\\wsl.localhost\Ubuntu\home\me\.codex\sessions"))
+            Some(&OsString::from(
+                r"\\wsl.localhost\Ubuntu\home\me\.codex\sessions"
+            ))
         );
     }
 
