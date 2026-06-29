@@ -1171,14 +1171,24 @@ func (e *Engine) resyncAllLocked(
 		)
 	}
 
-	// 3. Point engine at newDB and sync into it.
+	// 3. Point engine at newDB and sync into it. Report discovery as its
+	// own phase first: syncAllLocked walks every source before emitting
+	// its first syncing event, and on a large archive that walk takes
+	// minutes. Without this marker the progress printer credits that
+	// silent time to the preceding (instant) "Disabling ..." phase.
 	e.openCodeArchiveStore = origDB
 	e.db = newDB
+	reportResyncPhase(
+		PhaseDiscovering,
+		"Discovering sessions",
+		"",
+	)
 	stats = e.syncAllLocked(
 		ctx, reportResyncProgress, time.Time{}, nil, syncWriteBulk, true,
 	)
 	e.db = origDB // restore immediately
 	e.openCodeArchiveStore = nil
+	e.phaseStats.Log("resync")
 
 	// Abort swap when the fresh DB would be worse than the
 	// original:
@@ -1772,6 +1782,17 @@ func (e *Engine) syncAllLocked(
 
 	t0 := time.Now()
 
+	// Report discovery as its own phase before the walk. syncAllLocked
+	// visits every source before emitting any syncing progress, and on a
+	// large archive that walk takes minutes; without this marker a
+	// daemon-driven `agentsview sync` shows no terminal feedback until the
+	// walk and DB-backed count both finish. The resync path emits the same
+	// marker, so its progress printer dedupes on the matching Detail.
+	e.reportProgress(onProgress, Progress{
+		Phase:  PhaseDiscovering,
+		Detail: "Discovering sessions",
+	})
+
 	var all []parser.DiscoveredFile
 	counts := make(map[parser.AgentType]int)
 	providerFound, providerFailures := e.discoverProviderSources(ctx, scope)
@@ -1806,31 +1827,39 @@ func (e *Engine) syncAllLocked(
 
 	verbose := onProgress == nil
 
-	if verbose {
-		log.Printf(
-			"discovered %d files (%d claude, %d codex, %d copilot, %d gemini, %d cursor, %d amp, %d zencoder, %d iflow, %d vscode-copilot, %d visualstudio-copilot, %d pi, %d omp, %d kiro, %d zed, %d vibe) in %s",
-			len(all),
-			counts[parser.AgentClaude],
-			counts[parser.AgentCodex],
-			counts[parser.AgentCopilot],
-			counts[parser.AgentGemini],
-			counts[parser.AgentCursor],
-			counts[parser.AgentAmp],
-			counts[parser.AgentZencoder],
-			counts[parser.AgentIflow],
-			counts[parser.AgentVSCodeCopilot],
-			counts[parser.AgentVSCopilot],
-			counts[parser.AgentPi],
-			counts[parser.AgentOMP],
-			counts[parser.AgentKiro],
-			counts[parser.AgentZed],
-			counts[parser.AgentVibe],
-			time.Since(t0).Round(time.Millisecond),
-		)
-	}
+	// Always log discovery timing: this is the only window into the
+	// otherwise-silent provider walk, which dominates resync wall-clock
+	// on large archives. Suppressing it behind verbose hid that cost on
+	// the daemon resync and interactive sync paths (both pass onProgress).
+	log.Printf(
+		"discovered %d files (%d claude, %d codex, %d copilot, %d gemini, %d cursor, %d amp, %d zencoder, %d iflow, %d vscode-copilot, %d visualstudio-copilot, %d pi, %d omp, %d kiro, %d zed, %d vibe) in %s",
+		len(all),
+		counts[parser.AgentClaude],
+		counts[parser.AgentCodex],
+		counts[parser.AgentCopilot],
+		counts[parser.AgentGemini],
+		counts[parser.AgentCursor],
+		counts[parser.AgentAmp],
+		counts[parser.AgentZencoder],
+		counts[parser.AgentIflow],
+		counts[parser.AgentVSCodeCopilot],
+		counts[parser.AgentVSCopilot],
+		counts[parser.AgentPi],
+		counts[parser.AgentOMP],
+		counts[parser.AgentKiro],
+		counts[parser.AgentZed],
+		counts[parser.AgentVibe],
+		time.Since(t0).Round(time.Millisecond),
+	)
 
 	progressTotal := len(all)
-	progressTotal += e.countDBBackedSessions(ctx, scope)
+	tDBCount := time.Now()
+	dbBackedCount := e.countDBBackedSessions(ctx, scope)
+	progressTotal += dbBackedCount
+	log.Printf(
+		"counted %d db-backed sessions in %s",
+		dbBackedCount, time.Since(tDBCount).Round(time.Millisecond),
+	)
 	e.reportProgress(onProgress, Progress{
 		Phase:         PhaseSyncing,
 		SessionsTotal: progressTotal,
@@ -1976,6 +2005,12 @@ func (e *Engine) syncAllLocked(
 	return stats
 }
 
+// slowProviderDiscoveryThreshold is the per-provider discovery duration above
+// which discovery timing is logged. Most providers finish in well under a
+// millisecond; a provider over this bound is doing real per-source work worth
+// surfacing.
+const slowProviderDiscoveryThreshold = 100 * time.Millisecond
+
 // discoverProviderSources runs full-sync discovery through the provider facade
 // for every concrete provider that is authoritative. It is the sole on-disk
 // discovery path: every file-based agent owns discovery through its provider.
@@ -2020,7 +2055,17 @@ func (e *Engine) discoverProviderSources(
 			Roots:   filteredRoots,
 			Machine: e.machine,
 		})
+		tDiscover := time.Now()
 		sources, err := provider.Discover(ctx)
+		// Log only providers whose discovery is slow enough to matter, so a
+		// single pathological provider (e.g. a per-source map rebuild) stands
+		// out instead of hiding inside the aggregate discovery timing.
+		if d := time.Since(tDiscover); d >= slowProviderDiscoveryThreshold {
+			log.Printf(
+				"discovery: %s returned %d sources in %s",
+				agentType, len(sources), d.Round(time.Millisecond),
+			)
+		}
 		if err != nil {
 			log.Printf("%s provider discovery: %v", agentType, err)
 			failures++
