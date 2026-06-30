@@ -93,9 +93,9 @@ func resolveService(
 
 // resolveWritableService constructs a write-capable SessionService:
 // HTTP when a writable daemon is reachable, otherwise a direct
-// backend wired with a real sync.Engine. It refuses read-only
-// daemons (pg serve) and unreachable writable daemons. Callers MUST defer the returned
-// cleanup. Read-only commands should use resolveService instead.
+// backend wired with a real sync.Engine. It refuses read-only daemons
+// and unreachable writable daemons. Callers MUST defer the returned cleanup.
+// Read-only commands should use resolveService instead.
 func resolveWritableService(
 	cmd *cobra.Command,
 ) (service.SessionService, func(), error) {
@@ -144,8 +144,9 @@ func resolveWritableServiceWithIntent(
 	}
 	if tr.Mode == transportHTTP && tr.ReadOnly {
 		return nil, nil, fmt.Errorf(
-			"daemon at %s is read-only (pg serve); cannot write: stop "+
-				"'pg serve' and use the local DB, or start a local daemon",
+			"daemon at %s is read-only; cannot write: stop the "+
+				"read-only serve process and use the local DB, "+
+				"or start a local daemon",
 			tr.URL,
 		)
 	}

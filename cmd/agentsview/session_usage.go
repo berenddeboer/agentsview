@@ -119,7 +119,7 @@ func sessionUsageDataForCommand(
 func readOnlySessionUsageDaemonError(url string) error {
 	return fmt.Errorf(
 		"daemon at %s is read-only; use --pg to query "+
-			"PostgreSQL usage, or stop it to refresh local "+
+			"a read-only mirror, or stop it to refresh local "+
 			"session usage",
 		url,
 	)
@@ -191,7 +191,15 @@ func pgSessionUsageData(
 	if cleanup != nil {
 		defer cleanup()
 	}
+	return storeSessionUsageData("pg", cfg, store, sessionID)
+}
 
+func storeSessionUsageData(
+	storeName string,
+	cfg config.Config,
+	store db.Store,
+	sessionID string,
+) (*sessionUsageOutput, int, error) {
 	if len(cfg.CustomModelPricing) > 0 {
 		if priced, ok := store.(customPricingStore); ok {
 			priced.SetCustomPricing(cfg.CustomModelPricing)
@@ -203,7 +211,7 @@ func pgSessionUsageData(
 	if err != nil {
 		if !strings.HasPrefix(err.Error(), "session not found:") {
 			return nil, tokenUseExitErr,
-				fmt.Errorf("resolving pg session id: %w", err)
+				fmt.Errorf("resolving %s session id: %w", storeName, err)
 		}
 		fmt.Fprintf(os.Stderr, "session not found: %s\n", sessionID)
 		return nil, tokenUseExitNotFound, nil
@@ -212,7 +220,7 @@ func pgSessionUsageData(
 	u, err := store.GetSessionUsage(ctx, resolvedID)
 	if err != nil {
 		return nil, tokenUseExitErr,
-			fmt.Errorf("querying pg session usage: %w", err)
+			fmt.Errorf("querying %s session usage: %w", storeName, err)
 	}
 	if u == nil {
 		fmt.Fprintf(os.Stderr, "session not found: %s\n", sessionID)

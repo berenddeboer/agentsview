@@ -672,6 +672,9 @@ func newDuckDBPushCommand() *cobra.Command {
 	cmd.Flags().StringVar(&cfg.ProjectsFlag, "projects", "", "Comma-separated list of projects to push (inclusive)")
 	cmd.Flags().StringVar(&cfg.ExcludeProjects, "exclude-projects", "", "Comma-separated list of projects to exclude from push")
 	cmd.Flags().BoolVar(&cfg.AllProjects, "all-projects", false, "Ignore configured project filters for this run")
+	cmd.Flags().BoolVar(&cfg.Watch, "watch", false, "Continue watching local files and pushing changes")
+	cmd.Flags().DurationVar(&cfg.Debounce, "debounce", defaultWatchDebounce, "Coalesce window after a change before pushing (--watch only)")
+	cmd.Flags().DurationVar(&cfg.Interval, "interval", defaultWatchInterval, "Periodic floor push interval (--watch only)")
 	return cmd
 }
 
@@ -741,7 +744,7 @@ func newDuckDBQuackCommand() *cobra.Command {
 	)
 	serveCmd.Flags().StringVar(
 		&serveCfg.Token, "token", "",
-		"Quack authentication token (generated if omitted)",
+		"Quack authentication token (required unless configured)",
 	)
 	serveCmd.Flags().BoolVar(
 		&serveCfg.AllowInsecure, "allow-insecure", false,

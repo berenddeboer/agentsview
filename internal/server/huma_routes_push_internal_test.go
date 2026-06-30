@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
+	duckdbsync "go.kenn.io/agentsview/internal/duckdb"
 )
 
 type openAPISpec struct {
@@ -107,6 +108,24 @@ func TestPGPushRejectsIncludeAndExcludeProjects(t *testing.T) {
 		"projects and exclude_projects are mutually exclusive")
 }
 
+func TestDuckDBPushRejectsIncludeAndExcludeProjects(t *testing.T) {
+	s := testServerWithConfig(config.Config{})
+
+	_, err := s.humaDuckDBPush(context.Background(), &daemonPushInput{
+		Body: daemonPushRequest{
+			Projects:        []string{"alpha"},
+			ExcludeProjects: []string{"beta"},
+		},
+	})
+	require.Error(t, err)
+
+	var statusErr interface{ GetStatus() int }
+	require.ErrorAs(t, err, &statusErr)
+	assert.Equal(t, http.StatusBadRequest, statusErr.GetStatus())
+	assert.Contains(t, err.Error(),
+		"projects and exclude_projects are mutually exclusive")
+}
+
 func TestDuckDBPushConfigRequestOverrideSkipsDaemonEnvResolution(t *testing.T) {
 	const envName = "AGENTSVIEW_TEST_MISSING_DUCKDB_PATH_25053"
 	s := testServerWithConfig(config.Config{
@@ -123,6 +142,21 @@ func TestDuckDBPushConfigRequestOverrideSkipsDaemonEnvResolution(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "/tmp/agentsview.duckdb", got.Path)
 	assert.Equal(t, "workstation", got.MachineName)
+}
+
+func TestDuckDBPushSyncOptionsDerivesRemoteTargetScope(t *testing.T) {
+	duckCfg := config.DuckDBConfig{
+		URL:   "quack:https://duck.example.test?token=secret",
+		Token: "other-secret",
+	}
+
+	got := duckDBPushSyncOptions(daemonPushRequest{
+		Projects: []string{"alpha"},
+	}, duckCfg)
+
+	assert.Equal(t, []string{"alpha"}, got.Projects)
+	assert.Equal(t, duckdbsync.SyncStateTargetForConfig(duckCfg), got.SyncStateTarget)
+	assert.NotContains(t, got.SyncStateTarget, "secret")
 }
 
 func TestSyncRemotesRouteIsStreaming(t *testing.T) {

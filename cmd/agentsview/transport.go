@@ -46,7 +46,7 @@ var waitForDaemonStartupForTransport = WaitForDaemonStartupContext
 type transport struct {
 	Mode           transportMode
 	URL            string
-	ReadOnly       bool // daemon runtime ReadOnly flag (true for pg serve)
+	ReadOnly       bool // daemon runtime ReadOnly flag (true for mirror serve)
 	DirectReadOnly bool // writable daemon owns DB but is not reachable
 	DirectReason   string
 	Runtime        *DaemonRuntime

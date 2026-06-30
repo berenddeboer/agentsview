@@ -72,6 +72,21 @@ func (s *Server) duckDBPushConfig(
 	return s.cfg.ResolveDuckDB()
 }
 
+func duckDBPushSyncOptions(
+	req daemonPushRequest,
+	duckCfg config.DuckDBConfig,
+) duckdbsync.SyncOptions {
+	syncStateTarget := req.SyncStateTarget
+	if syncStateTarget == "" {
+		syncStateTarget = duckdbsync.SyncStateTargetForConfig(duckCfg)
+	}
+	return duckdbsync.SyncOptions{
+		Projects:        req.Projects,
+		ExcludeProjects: req.ExcludeProjects,
+		SyncStateTarget: syncStateTarget,
+	}
+}
+
 func (s *Server) humaPGPush(
 	ctx context.Context,
 	in *daemonPushInput,
@@ -128,6 +143,12 @@ func (s *Server) humaDuckDBPush(
 	ctx context.Context,
 	in *daemonPushInput,
 ) (*duckDBPushOutput, error) {
+	if err := postgres.ValidateProjectFilters(
+		in.Body.Projects,
+		in.Body.ExcludeProjects,
+	); err != nil {
+		return nil, apiError(http.StatusBadRequest, err.Error())
+	}
 	local, err := s.localPushTarget()
 	if err != nil {
 		return nil, err
@@ -138,16 +159,22 @@ func (s *Server) humaDuckDBPush(
 	}
 
 	engine := s.syncEngineForLocal(local)
+	opts := duckDBPushSyncOptions(in.Body, duckCfg)
 	var result duckdbsync.PushResult
 	_, err = engine.SyncThenRun(ctx, in.Body.Full, nil,
 		func(forceFull bool) error {
-			syncer, err := duckdbsync.New(
-				duckCfg.Path, local, duckCfg.MachineName,
-				duckdbsync.SyncOptions{
-					Projects:        in.Body.Projects,
-					ExcludeProjects: in.Body.ExcludeProjects,
-				},
-			)
+			var syncer *duckdbsync.Sync
+			var err error
+			if duckCfg.URL != "" {
+				syncer, err = duckdbsync.NewFromConfig(
+					duckCfg, local, opts,
+				)
+			} else {
+				syncer, err = duckdbsync.New(
+					duckCfg.Path, local, duckCfg.MachineName,
+					opts,
+				)
+			}
 			if err != nil {
 				return err
 			}

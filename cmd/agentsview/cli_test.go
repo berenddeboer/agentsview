@@ -42,6 +42,7 @@ func TestRootHelpShowsKeySectionsAndCommands(t *testing.T) {
 		"serve                  Start server",
 		"duckdb status          Show DuckDB sync status",
 		"pg push                Push local data to PostgreSQL",
+		"duckdb quack           Quack remote protocol commands",
 		"usage daily            Daily cost summary",
 		"completion             Generate the autocompletion script for the specified shell",
 		"Flags:",
@@ -72,6 +73,13 @@ func TestRootHelpShowsDuckDBEnvironment(t *testing.T) {
 	assert.NotContains(t, help, "env-token")
 }
 
+func TestRootHelpShowsQuackEnvironment(t *testing.T) {
+	help, err := executeCommand(newRootCommand(), "--help")
+	require.NoError(t, err, "Execute")
+	assert.NotContains(t, help, "AGENTSVIEW_QUACK_URL")
+	assert.NotContains(t, help, "AGENTSVIEW_QUACK_TOKEN")
+}
+
 func TestRootHelpDocumentsCopilotExportDir(t *testing.T) {
 	help, err := executeCommand(newRootCommand(), "--help")
 	require.NoError(t, err, "Execute")
@@ -87,6 +95,9 @@ func TestDuckDBPushHelpShowsProjectFlags(t *testing.T) {
 		"--projects",
 		"--exclude-projects",
 		"--all-projects",
+		"--watch",
+		"--debounce",
+		"--interval",
 	} {
 		assert.Contains(t, help, want)
 	}
@@ -111,10 +122,12 @@ func TestDuckDBQuackServeHelpShowsSafetyFlags(t *testing.T) {
 		"--bind",
 		"--path",
 		"--token",
+		"required",
 		"--allow-insecure",
 	} {
 		assert.Contains(t, help, want)
 	}
+	assert.NotContains(t, help, "generated if omitted")
 }
 
 func TestOpenAPICommandEmitsSpec(t *testing.T) {

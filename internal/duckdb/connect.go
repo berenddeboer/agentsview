@@ -1,7 +1,10 @@
 package duckdb
 
 import (
+	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"net"
 	neturl "net/url"
@@ -9,6 +12,7 @@ import (
 	"strings"
 
 	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
 )
 
 // Open opens a local DuckDB file for the agentsview mirror backend.
@@ -32,6 +36,142 @@ func Open(path string) (*sql.DB, error) {
 	return db, nil
 }
 
+// ReadLastPushAt reads the local DuckDB push watermark for the optional
+// PG-compatible target scope.
+func ReadLastPushAt(local *db.DB, syncStateTarget string) (string, error) {
+	if local == nil {
+		return "", fmt.Errorf("local sync state is required")
+	}
+	return local.GetSyncState(
+		scopedDuckDBSyncStateKey(lastPushStateKey, syncStateTarget),
+	)
+}
+
+// SyncStateTargetForConfig returns the local sync-state scope for a DuckDB
+// target. Local file mirrors keep the historical unscoped watermark; remote
+// Quack targets get a non-secret URL fingerprint so distinct remotes cannot
+// reuse each other's push watermark.
+func SyncStateTargetForConfig(cfg config.DuckDBConfig) string {
+	if strings.TrimSpace(cfg.URL) == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(canonicalDuckDBSyncTarget(cfg.URL)))
+	encoded := hex.EncodeToString(sum[:])
+	return "url-" + encoded[:16]
+}
+
+func canonicalDuckDBSyncTarget(rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return ""
+	}
+	if !strings.HasPrefix(rawURL, "quack:") {
+		return rawURL
+	}
+	transport := strings.TrimPrefix(rawURL, "quack:")
+	if strings.HasPrefix(transport, "http://") ||
+		strings.HasPrefix(transport, "https://") {
+		if u, err := neturl.Parse(transport); err == nil {
+			u.User = nil
+			q := u.Query()
+			for key := range q {
+				if isSecretURLQueryKey(key) {
+					q.Del(key)
+				}
+			}
+			u.RawQuery = q.Encode()
+			u.Fragment = ""
+			return "quack:" + u.String()
+		}
+	}
+	transport = strings.SplitN(transport, "#", 2)[0]
+	transport = strings.SplitN(transport, "?", 2)[0]
+	if at := strings.LastIndex(transport, "@"); at >= 0 {
+		transport = transport[at+1:]
+	}
+	return "quack:" + transport
+}
+
+func isSecretURLQueryKey(key string) bool {
+	lower := strings.ToLower(key)
+	return isCredentialQueryKey(lower, "auth") ||
+		isCredentialQueryKey(lower, "token") ||
+		isCredentialQueryKey(lower, "secret") ||
+		isCredentialQueryKey(lower, "password") ||
+		isCredentialQueryKey(lower, "key")
+}
+
+func isCredentialQueryKey(key, credential string) bool {
+	if key == credential {
+		return true
+	}
+	for _, sep := range []string{"_", "-", "."} {
+		if strings.HasSuffix(key, sep+credential) {
+			return true
+		}
+	}
+	return false
+}
+
+// ReadStatusFromConfig reads DuckDB/Quack row counts without requiring a local
+// Sync handle. Callers pass any local last-push watermark they want displayed.
+func ReadStatusFromConfig(
+	ctx context.Context,
+	cfg config.DuckDBConfig,
+	lastPush string,
+) (SyncStatus, error) {
+	if cfg.MachineName == "" {
+		return SyncStatus{}, fmt.Errorf("machine name must not be empty")
+	}
+	store, err := NewStoreFromConfig(cfg)
+	if err != nil {
+		return SyncStatus{}, err
+	}
+	defer store.Close()
+	return readMachineStatus(ctx, store.DB(), cfg.MachineName, lastPush)
+}
+
+func readMachineStatus(
+	ctx context.Context,
+	duck *sql.DB,
+	machine string,
+	lastPush string,
+) (SyncStatus, error) {
+	status := SyncStatus{Machine: machine, LastPushAt: lastPush}
+	if err := duck.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sessions WHERE machine = ?`,
+		machine,
+	).Scan(&status.DuckDBSessions); err != nil {
+		if isMissingDuckDBTable(err) {
+			return status, nil
+		}
+		return SyncStatus{}, fmt.Errorf("counting duckdb sessions: %w", err)
+	}
+	if err := duck.QueryRowContext(ctx,
+		`SELECT COUNT(*)
+		 FROM messages
+		 WHERE session_id IN (
+			SELECT id FROM sessions WHERE machine = ?
+		 )`,
+		machine,
+	).Scan(&status.DuckDBMessages); err != nil {
+		if isMissingDuckDBTable(err) {
+			return status, nil
+		}
+		return SyncStatus{}, fmt.Errorf("counting duckdb messages: %w", err)
+	}
+	return status, nil
+}
+
+func isMissingDuckDBTable(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "does not exist") ||
+		strings.Contains(message, "table with name")
+}
+
 // NewStoreFromConfig opens either a local DuckDB mirror file or a remote
 // Quack endpoint. Quack endpoints are attached as the default catalog so the
 // Store's unqualified read queries work for both local and remote modes.
@@ -42,8 +182,51 @@ func NewStoreFromConfig(cfg config.DuckDBConfig) (*Store, error) {
 	return NewStore(cfg.Path)
 }
 
+// NewFromConfig opens either a local DuckDB mirror file or a remote Quack
+// endpoint for push sync.
+func NewFromConfig(
+	cfg config.DuckDBConfig, local *db.DB, opts SyncOptions,
+) (*Sync, error) {
+	if local == nil {
+		return nil, fmt.Errorf("local db is required")
+	}
+	if cfg.MachineName == "" {
+		return nil, fmt.Errorf("machine name must not be empty")
+	}
+	var (
+		duck *sql.DB
+		err  error
+	)
+	if cfg.URL != "" {
+		duck, err = OpenQuack(cfg.URL, cfg.Token, cfg.AllowInsecure)
+	} else {
+		duck, err = Open(cfg.Path)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &Sync{
+		duck:            duck,
+		local:           local,
+		machine:         cfg.MachineName,
+		syncStateScope:  opts.SyncStateTarget,
+		projects:        opts.Projects,
+		excludeProjects: opts.ExcludeProjects,
+	}, nil
+}
+
 // NewQuackStore attaches a remote DuckDB exposed over Quack.
 func NewQuackStore(rawURL, token string, allowInsecure bool) (*Store, error) {
+	conn, err := OpenQuack(rawURL, token, allowInsecure)
+	if err != nil {
+		return nil, err
+	}
+	return NewStoreFromDB(conn), nil
+}
+
+// OpenQuack opens an in-memory DuckDB client and attaches a remote DuckDB
+// exposed over Quack as the default catalog.
+func OpenQuack(rawURL, token string, allowInsecure bool) (*sql.DB, error) {
 	if err := ValidateQuackClientURL(rawURL, token, allowInsecure); err != nil {
 		return nil, err
 	}
@@ -81,7 +264,7 @@ func NewQuackStore(rawURL, token string, allowInsecure bool) (*Store, error) {
 		conn.Close()
 		return nil, fmt.Errorf("selecting quack catalog: %w", err)
 	}
-	return NewStoreFromDB(conn), nil
+	return conn, nil
 }
 
 func configureDuckDBThreads(db *sql.DB) error {
@@ -158,18 +341,45 @@ func duckLiteral(s string) string {
 // RedactQuackURL removes common token query fields from a URL before logging.
 func RedactQuackURL(rawURL string) string {
 	transport := strings.TrimPrefix(rawURL, "quack:")
+	if !strings.HasPrefix(transport, "http://") &&
+		!strings.HasPrefix(transport, "https://") {
+		return "quack:" + redactNativeQuackTransport(transport)
+	}
 	u, err := neturl.Parse(transport)
 	if err != nil {
 		return "quack:<redacted>"
 	}
+	u.User = nil
 	q := u.Query()
-	for _, key := range []string{"token", "access_token", "auth"} {
-		if q.Has(key) {
+	for key := range q {
+		if isSecretURLQueryKey(key) {
 			q.Set(key, "<redacted>")
 		}
 	}
 	u.RawQuery = q.Encode()
+	u.Fragment = ""
 	return "quack:" + u.String()
+}
+
+func redactNativeQuackTransport(transport string) string {
+	transport = strings.SplitN(transport, "#", 2)[0]
+	base, rawQuery, hasQuery := strings.Cut(transport, "?")
+	if at := strings.LastIndex(base, "@"); at >= 0 {
+		base = base[at+1:]
+	}
+	if !hasQuery {
+		return base
+	}
+	q, err := neturl.ParseQuery(rawQuery)
+	if err != nil {
+		return base
+	}
+	for key := range q {
+		if isSecretURLQueryKey(key) {
+			q.Set(key, "<redacted>")
+		}
+	}
+	return base + "?" + q.Encode()
 }
 
 // ValidateQuackServeURI rejects accidental public Quack exposure unless the

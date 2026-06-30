@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -15,6 +17,12 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	duckdbsync "go.kenn.io/agentsview/internal/duckdb"
 )
+
+func TestDuckDBLongRunningSignalsIncludeSIGTERM(t *testing.T) {
+	signals := duckDBLongRunningSignals()
+	assert.Contains(t, signals, os.Interrupt)
+	assert.Contains(t, signals, syscall.SIGTERM)
+}
 
 func TestResolveDuckDBPushProjects(t *testing.T) {
 	tests := []projectResolutionCase[DuckDBPushConfig]{
@@ -117,6 +125,113 @@ func TestArchiveWriteBackendDuckDBPushAbsolutizesRelativeDaemonPath(t *testing.T
 	require.NoError(t, err)
 }
 
+func TestArchiveWriteBackendDuckDBPushPostsRemoteURLToDaemon(t *testing.T) {
+	duckCfg := config.DuckDBConfig{
+		URL:           "quack:https://duck.example.test",
+		Token:         "quack-token",
+		AllowInsecure: true,
+	}
+	ts := duckDBPushDaemonServer(t, wantDuckDBDaemonPush{
+		auth:            "Bearer secret",
+		full:            true,
+		projects:        []string{"a"},
+		excludeProjects: []string{"b"},
+		url:             duckCfg.URL,
+		token:           duckCfg.Token,
+		allowInsecure:   duckCfg.AllowInsecure,
+		syncStateTarget: duckdbsync.SyncStateTargetForConfig(duckCfg),
+	}, duckdbsync.PushResult{
+		SessionsPushed: 2,
+		MessagesPushed: 3,
+		Duration:       time.Second,
+	})
+
+	backend := newDaemonArchiveWriteBackendForTest(
+		config.Config{AuthToken: "secret"}, ts.URL,
+	)
+	result, err := backend.DuckDBPush(
+		context.Background(),
+		duckCfg,
+		DuckDBPushConfig{Full: true},
+		[]string{"a"},
+		[]string{"b"},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 2, result.SessionsPushed)
+	assert.Equal(t, 3, result.MessagesPushed)
+}
+
+func TestArchiveWriteBackendDuckDBPushWatchReResolvesDaemon(t *testing.T) {
+	dataDir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	var startupPushes int
+	startup := pushRuntimeServer(t, "/api/v1/push/duckdb", func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		startupPushes++
+		var req daemonPushRequest
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		require.NotNil(t, req.DuckDB)
+		assert.Equal(t, "quack:https://duck.example.test", req.DuckDB.URL)
+		assert.Equal(t, "secret", req.DuckDB.Token)
+		writeTestJSON(t, w, duckdbsync.PushResult{SessionsPushed: 1})
+	})
+	var resolvedPushes int
+	resolved := pushRuntimeServer(t, "/api/v1/push/duckdb", func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		resolvedPushes++
+		cancel()
+		var req daemonPushRequest
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		require.NotNil(t, req.DuckDB)
+		assert.Equal(t, "quack:https://duck.example.test", req.DuckDB.URL)
+		assert.Equal(t, "secret", req.DuckDB.Token)
+		writeTestJSON(t, w, duckdbsync.PushResult{SessionsPushed: 1})
+	})
+	registerTestRuntime(t, dataDir, resolved.URL, false)
+
+	backend := newDaemonArchiveWriteBackendForTest(
+		config.Config{DataDir: dataDir}, startup.URL,
+	)
+	err := backend.DuckDBPushWatch(
+		ctx,
+		config.DuckDBConfig{
+			URL:   "quack:https://duck.example.test",
+			Token: "secret",
+		},
+		DuckDBPushConfig{},
+		nil,
+		nil,
+		time.Millisecond,
+		time.Millisecond,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 1, startupPushes)
+	assert.GreaterOrEqual(t, resolvedPushes, 1)
+	assert.NoFileExists(t, filepath.Join(dataDir, "sessions.db"))
+}
+
+func TestWriteDuckDBQuackServeStartupDoesNotPrintToken(t *testing.T) {
+	var out bytes.Buffer
+	const token = "plain-quack-secret-token"
+
+	writeDuckDBQuackServeStartup(
+		&out,
+		duckDBQuackServeStartup{
+			Path: "/tmp/agentsview.duckdb",
+			Bind: "quack:127.0.0.1:9494",
+			Info: quackServeInfo{ListenURI: "quack:127.0.0.1:9494"},
+		},
+	)
+
+	got := out.String()
+	assert.NotContains(t, got, token)
+	assert.Contains(t, got, "Token:       configured")
+}
+
 // wantDuckDBDaemonPush is the expected shape of a DuckDB daemon push request.
 type wantDuckDBDaemonPush struct {
 	auth            string
@@ -124,7 +239,11 @@ type wantDuckDBDaemonPush struct {
 	projects        []string
 	excludeProjects []string
 	path            string
+	url             string
+	token           string
 	machineName     string
+	allowInsecure   bool
+	syncStateTarget string
 }
 
 // duckDBPushDaemonServer starts a daemon test server on the DuckDB push route
@@ -135,7 +254,17 @@ func duckDBPushDaemonServer(
 	result duckdbsync.PushResult,
 ) *httptest.Server {
 	t.Helper()
-	return pushRuntimeServer(t, "/api/v1/push/duckdb", func(
+	return duckDBPushDaemonServerAt(t, "/api/v1/push/duckdb", want, result)
+}
+
+func duckDBPushDaemonServerAt(
+	t *testing.T,
+	path string,
+	want wantDuckDBDaemonPush,
+	result duckdbsync.PushResult,
+) *httptest.Server {
+	t.Helper()
+	return pushRuntimeServer(t, path, func(
 		w http.ResponseWriter,
 		r *http.Request,
 	) {
@@ -147,67 +276,51 @@ func duckDBPushDaemonServer(
 		assert.Equal(t, want.excludeProjects, req.ExcludeProjects)
 		require.NotNil(t, req.DuckDB)
 		assert.Equal(t, want.path, req.DuckDB.Path)
+		assert.Equal(t, want.url, req.DuckDB.URL)
+		assert.Equal(t, want.token, req.DuckDB.Token)
 		assert.Equal(t, want.machineName, req.DuckDB.MachineName)
+		assert.Equal(t, want.allowInsecure, req.DuckDB.AllowInsecure)
+		assert.Equal(t, want.syncStateTarget, req.SyncStateTarget)
 		writeTestJSON(t, w, result)
 	})
 }
 
 func TestResolveQuackServeToken(t *testing.T) {
-	generateErr := errors.New("generate failed")
 	tests := []struct {
 		name       string
 		flagToken  string
 		configured string
-		generated  string
-		genErr     error
 		wantToken  string
-		wantGen    bool
-		wantErr    bool
+		wantErr    string
 	}{
 		{
 			name:       "flag token wins",
 			flagToken:  "flag-token",
 			configured: "config-token",
-			generated:  "generated-token",
 			wantToken:  "flag-token",
 		},
 		{
-			name:       "configured token used before generation",
+			name:       "configured token used",
 			configured: "config-token",
-			generated:  "generated-token",
 			wantToken:  "config-token",
 		},
 		{
-			name:      "generates token when none configured",
-			generated: "generated-token",
-			wantToken: "generated-token",
-			wantGen:   true,
-		},
-		{
-			name:    "generator error returned",
-			genErr:  generateErr,
-			wantErr: true,
+			name:    "requires explicit token",
+			wantErr: "token is required",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			called := false
-			token, generated, err := resolveQuackServeToken(
+			token, err := resolveQuackServeToken(
 				tt.flagToken, tt.configured,
-				func() (string, error) {
-					called = true
-					return tt.generated, tt.genErr
-				},
 			)
-			if tt.wantErr {
+			if tt.wantErr != "" {
 				require.Error(t, err)
-				assert.True(t, called)
+				assert.Contains(t, err.Error(), tt.wantErr)
 				return
 			}
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantToken, token)
-			assert.Equal(t, tt.wantGen, generated)
-			assert.Equal(t, tt.wantGen, called)
 		})
 	}
 }
