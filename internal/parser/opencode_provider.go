@@ -3,7 +3,9 @@ package parser
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -11,6 +13,13 @@ import (
 )
 
 var _ Provider = (*openCodeFormatProvider)(nil)
+
+// A SQLite WAL begins with a 32-byte header. Bytes beyond the header are
+// transaction frames, so a larger WAL can contain source changes worth
+// syncing. Read-only SQLite connections may create an empty WAL and its SHM
+// index simply by opening a quiet WAL-mode database; those sidecars must not
+// make the watcher trigger itself.
+const sqliteWALHeaderSize = int64(32)
 
 type openCodeFormatProviderFactory struct {
 	def  AgentDef
@@ -350,7 +359,7 @@ func (s openCodeFormatSourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 				IncludeGlobs: []string{
 					"*.json",
 					s.spec.dbName,
-					s.spec.dbName + "-*",
+					s.spec.dbName + "-wal",
 				},
 				DebounceKey: string(s.spec.agent) + ":opencode:" + watchRoot,
 			})
@@ -545,8 +554,27 @@ func (s openCodeFormatSourceSet) sourcesForChangedPathInRoot(
 	if !ok {
 		return nil, false, nil
 	}
-	base := filepath.Base(rel)
-	if rel == s.spec.dbName || strings.HasPrefix(base, s.spec.dbName+"-") {
+	isSQLiteChange := true
+	switch rel {
+	case s.spec.dbName + "-shm":
+		// SHM is only SQLite's WAL index. WAL frames (or the checkpointed main
+		// database) carry the source changes, so SHM events are redundant.
+		return nil, true, nil
+	case s.spec.dbName + "-wal":
+		// A read-only connection can create an empty WAL while inspecting a
+		// quiet database. Ignore it, as well as WAL removal after a checkpoint;
+		// the corresponding main-database write is watched separately.
+		if !sqliteWALHasFrames(path) {
+			return nil, true, nil
+		}
+	case s.spec.dbName:
+		// The main database and WALs with transaction frames both fan out to
+		// the logical sessions stored in this shared SQLite container.
+	default:
+		isSQLiteChange = false
+	}
+
+	if isSQLiteChange {
 		dbPath := filepath.Join(root, s.spec.dbName)
 		if !IsRegularFile(dbPath) {
 			return nil, true, nil
@@ -638,6 +666,20 @@ func (s openCodeFormatSourceSet) sourcesForChangedPathInRoot(
 		return []SourceRef{source}, true, nil
 	}
 	return nil, false, nil
+}
+
+func sqliteWALHasFrames(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		// Only a missing WAL is a definitive no-op. Other stat failures fail
+		// open so a real update is synced instead of silently dropped; at
+		// worst that costs one redundant sync.
+		return !errors.Is(err, fs.ErrNotExist)
+	}
+	if info == nil {
+		return false
+	}
+	return info.Mode().IsRegular() && info.Size() > sqliteWALHeaderSize
 }
 
 func (s openCodeFormatSourceSet) sourceForRawID(root, sessionID string) (SourceRef, bool) {
