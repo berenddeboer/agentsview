@@ -1,4 +1,12 @@
 import {
+  getHighContrast,
+  initTheme,
+  isDark,
+  MEDIA,
+  setHighContrast,
+  setThemeMode,
+} from "@kenn-io/kit-ui";
+import {
   SIDEBAR_WIDTH_DEFAULT,
   SIDEBAR_WIDTH_KEY,
   clampStoredSidebarWidth,
@@ -156,16 +164,31 @@ const VALID_LAYOUTS: MessageLayout[] = [
   "stream",
   "skim",
 ];
-function readStoredTheme(): Theme | null {
-  if (
-    typeof localStorage !== "undefined" &&
-    localStorage != null &&
-    typeof localStorage.getItem === "function"
-  ) {
-    return localStorage.getItem("theme") as Theme;
+// Theme state lives in kit-ui's theme store (mode/high-contrast persistence,
+// root class management, and OS-preference tracking in "system" mode). Reuse
+// the app's historical "theme" storage key — its stored "light"/"dark" values
+// are valid kit-ui modes — and migrate the legacy high-contrast key to the
+// derived key kit-ui persists under.
+function migrateHighContrastKey(): void {
+  try {
+    if (
+      typeof localStorage === "undefined" ||
+      localStorage == null ||
+      typeof localStorage.getItem !== "function"
+    ) {
+      return;
+    }
+    const legacy = localStorage.getItem(HIGH_CONTRAST_KEY);
+    if (legacy !== null && localStorage.getItem("theme-high-contrast") === null) {
+      localStorage.setItem("theme-high-contrast", legacy);
+    }
+  } catch {
+    // Storage blocked — kit-ui falls back to in-memory state.
   }
-  return null;
 }
+
+migrateHighContrastKey();
+initTheme({ storageKey: "theme" });
 
 function readStoredLayout(): MessageLayout {
   try {
@@ -218,7 +241,24 @@ function readStoredBool(key: string, fallback: boolean): boolean {
   return fallback;
 }
 class UIStore {
-  theme: Theme = $state(readStoredTheme() || "light");
+  /** Resolved appearance from kit-ui's theme store; in "system" mode this
+   * tracks the OS preference. Assigning pins an explicit mode. */
+  get theme(): Theme {
+    return isDark() ? "dark" : "light";
+  }
+
+  set theme(value: Theme) {
+    setThemeMode(value);
+  }
+
+  get highContrast(): boolean {
+    return getHighContrast();
+  }
+
+  set highContrast(value: boolean) {
+    setHighContrast(value);
+  }
+
   sortNewestFirst: boolean = $state(false);
   messageLayout: MessageLayout = $state(readStoredLayout());
   transcriptMode: TranscriptMode = $state(
@@ -235,9 +275,6 @@ class UIStore {
 
   zoomLevel: number = $state(readStoredZoom());
   fontScale: number = $state(readStoredFontScale());
-  highContrast: boolean = $state(
-    readStoredBool(HIGH_CONTRAST_KEY, false),
-  );
 
   sidebarOpen: boolean = $state(true);
   isMobileViewport: boolean = $state(false);
@@ -257,22 +294,8 @@ class UIStore {
 
   constructor() {
     $effect.root(() => {
-      $effect(() => {
-        const root = document.documentElement;
-        if (this.theme === "dark") {
-          root.classList.add("dark");
-        } else {
-          root.classList.remove("dark");
-        }
-        if (
-          typeof localStorage !== "undefined" &&
-          localStorage != null &&
-          typeof localStorage.setItem === "function"
-        ) {
-          localStorage.setItem("theme", this.theme);
-        }
-      });
-
+      // Theme and high-contrast classes/persistence are owned by kit-ui's
+      // theme store (initTheme above); no effects needed here.
       $effect(() => {
         try {
           localStorage?.setItem(
@@ -345,22 +368,6 @@ class UIStore {
         }
       });
 
-      // Apply and persist high contrast.
-      $effect(() => {
-        document.documentElement.classList.toggle(
-          "high-contrast",
-          this.highContrast,
-        );
-        try {
-          localStorage?.setItem(
-            HIGH_CONTRAST_KEY,
-            String(this.highContrast),
-          );
-        } catch {
-          // ignore
-        }
-      });
-
       $effect(() => {
         try {
           localStorage?.setItem(
@@ -400,14 +407,16 @@ class UIStore {
         }
       });
 
-      // Initialize sidebar based on viewport width
+      // Initialize sidebar based on viewport width. MEDIA.medium is the same
+      // 760px query the component CSS uses, so the store and stylesheets
+      // agree on where mobile layout starts.
       if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
-        const mq = window.matchMedia("(min-width: 768px)");
-        this.sidebarOpen = mq.matches;
-        this.isMobileViewport = !mq.matches;
+        const mq = window.matchMedia(MEDIA.medium);
+        this.sidebarOpen = !mq.matches;
+        this.isMobileViewport = mq.matches;
         const onChange = (e: MediaQueryListEvent) => {
-          this.sidebarOpen = e.matches;
-          this.isMobileViewport = !e.matches;
+          this.sidebarOpen = !e.matches;
+          this.isMobileViewport = e.matches;
         };
         if (mq.addEventListener) {
           mq.addEventListener("change", onChange);

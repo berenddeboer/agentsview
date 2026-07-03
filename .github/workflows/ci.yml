@@ -55,6 +55,13 @@ jobs:
         run: npm run check
         working-directory: frontend
 
+      - name: Design-system conformance (kit-ui-check)
+        # Full rule set over all of src; legitimate exceptions carry inline
+        # kit-ui-check-ignore markers with reasons (e.g. the app token
+        # definitions in app.css).
+        run: npm run check:kit-ui
+        working-directory: frontend
+
       - name: Run frontend tests
         run: npm test
         working-directory: frontend

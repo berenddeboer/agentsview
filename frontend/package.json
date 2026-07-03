@@ -14,10 +14,12 @@
     "preview": "vp preview",
     "precheck": "npm run i18n:compile",
     "check": "svelte-check --tsconfig ./tsconfig.json",
+    "check:kit-ui": "kit-ui-check src",
     "test": "vp test run",
     "e2e": "playwright test"
   },
   "dependencies": {
+    "@kenn-io/kit-ui": "git+https://github.com/kenn-io/kit-ui.git#215d25278db71a95109164133b27a3eb539d5186",
     "@lucide/svelte": "1.21.0",
     "@tanstack/virtual-core": "3.17.1",
     "dompurify": "3.4.11",

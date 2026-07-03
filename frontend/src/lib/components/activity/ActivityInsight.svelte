@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { EmptyState, Spinner, Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
   import { InsightsService } from "../../api/generated/index";
   import { configureGeneratedClient } from "../../api/runtime.js";
@@ -13,9 +14,6 @@
   import { highlightCodeFences } from "../../utils/highlight-fences.js";
   import type { Insight, InsightsResponse, AgentName } from "../../api/types.js";
   import { LightbulbIcon, PlusIcon } from "../../icons.js";
-  import OptionTypeahead, {
-    type TypeaheadOption,
-  } from "../layout/OptionTypeahead.svelte";
 
   let {
     dateFrom,
@@ -190,7 +188,7 @@
 
   {#snippet agentPicker()}
     <div class="agent-typeahead">
-      <OptionTypeahead
+      <Typeahead
         options={agentOptions}
         value={insights.agent}
         disabled={generationUnavailable}
@@ -207,7 +205,7 @@
     <div class="state muted">{m.activity_insight_loading()}</div>
   {:else if generating}
     <div class="state generating">
-      <span class="spinner"></span>
+      <span aria-hidden="true"><Spinner size={12} /></span>
       <span>{m.activity_insight_generating_phase({ phase })}</span>
     </div>
   {:else if error}
@@ -233,23 +231,18 @@
       {@html renderMarkdown(insight.content)}
     </article>
   {:else}
-    <div class="empty-state">
-      <span class="empty-text">
-        {m.activity_insight_empty_text()}
-      </span>
-      <div class="gen-row">
-        {@render agentPicker()}
-        <button
-          class="generate-btn"
-          onclick={handleGenerate}
-          disabled={generationUnavailable}
-          title={unavailableTitle}
-        >
-          <PlusIcon size="12" strokeWidth="2.2" aria-hidden="true" />
-          {m.activity_insight_generate()}
-        </button>
-      </div>
-    </div>
+    <EmptyState title={m.activity_insight_empty_text()}>
+      {@render agentPicker()}
+      <button
+        class="generate-btn"
+        onclick={handleGenerate}
+        disabled={generationUnavailable}
+        title={unavailableTitle}
+      >
+        <PlusIcon size="12" strokeWidth="2.2" aria-hidden="true" />
+        {m.activity_insight_generate()}
+      </button>
+    </EmptyState>
   {/if}
 </section>
 
@@ -302,38 +295,13 @@
   .state {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: var(--space-4);
     font-size: 12px;
     color: var(--text-muted);
   }
 
   .state.error {
     color: var(--accent-red);
-  }
-
-  .spinner {
-    width: 12px;
-    height: 12px;
-    border: 1.5px solid var(--accent-blue);
-    border-top-color: transparent;
-    border-radius: 50%;
-    animation: spin 0.7s linear infinite;
-    flex-shrink: 0;
-  }
-
-  .empty-state {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 12px;
-    padding: 8px 0;
-  }
-
-  .empty-text {
-    font-size: 12px;
-    color: var(--text-muted);
-    line-height: 1.5;
-    max-width: 420px;
   }
 
   .gen-row {
@@ -352,7 +320,7 @@
   .generate-btn {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
+    gap: var(--space-2);
     height: 28px;
     padding: 0 12px;
     border-radius: var(--radius-sm);
@@ -362,12 +330,12 @@
     color: var(--accent-blue-foreground);
     letter-spacing: 0.01em;
     transition: opacity 0.12s, transform 0.1s, box-shadow 0.12s;
-    box-shadow: 0 1px 2px rgba(37, 99, 235, 0.2);
+    box-shadow: 0 1px 2px color-mix(in srgb, var(--accent-blue) 20%, transparent);
   }
 
   .generate-btn:hover:not(:disabled) {
     opacity: 0.92;
-    box-shadow: 0 2px 6px rgba(37, 99, 235, 0.3);
+    box-shadow: 0 2px 6px color-mix(in srgb, var(--accent-blue) 30%, transparent);
   }
 
   .generate-btn:active:not(:disabled) {
@@ -379,15 +347,6 @@
     opacity: 0.45;
     box-shadow: none;
     cursor: default;
-  }
-
-  @keyframes spin {
-    from {
-      transform: rotate(0deg);
-    }
-    to {
-      transform: rotate(360deg);
-    }
   }
 
   /* ── Markdown Content ── */

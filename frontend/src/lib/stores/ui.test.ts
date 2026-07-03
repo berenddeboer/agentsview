@@ -303,6 +303,38 @@ describe("UIStore", () => {
       expect(["light", "dark"]).toContain(ui.theme);
     });
 
+    it("migrates the legacy high-contrast key on module init", async () => {
+      const original = globalThis.localStorage;
+      const store = new Map<string, string>([
+        ["agentsview-high-contrast", "true"],
+      ]);
+      Object.defineProperty(globalThis, "localStorage", {
+        value: {
+          getItem: (key: string) => store.get(key) ?? null,
+          setItem: (key: string, value: string) => {
+            store.set(key, value);
+          },
+        },
+        writable: true,
+        configurable: true,
+      });
+      try {
+        // @ts-expect-error -- query string busts module cache
+        const mod = await import("./ui.svelte.js?hcMigration");
+        expect(store.get("theme-high-contrast")).toBe("true");
+        expect(mod.ui.highContrast).toBe(true);
+        // Reset the kit-ui singleton so later tests start from default state.
+        mod.ui.highContrast = false;
+      } finally {
+        document.documentElement.classList.remove("high-contrast");
+        Object.defineProperty(globalThis, "localStorage", {
+          value: original,
+          writable: true,
+          configurable: true,
+        });
+      }
+    });
+
     it("should survive when localStorage.getItem is unavailable", async () => {
       const original = globalThis.localStorage;
       // Replace with an object that lacks getItem/setItem
@@ -719,8 +751,10 @@ describe("UIStore", () => {
 
     it("should initialize sidebar closed on narrow viewport", async () => {
       const originalMatchMedia = window.matchMedia;
+      // The store watches kit-ui's MEDIA.medium (max-width: 760px), so a
+      // matching query means a narrow viewport.
       window.matchMedia = vi.fn().mockReturnValue({
-        matches: false,
+        matches: true,
         addEventListener: vi.fn(),
         removeEventListener: vi.fn(),
       }) as unknown as typeof window.matchMedia;
@@ -736,8 +770,9 @@ describe("UIStore", () => {
 
     it("should initialize sidebar open on wide viewport", async () => {
       const originalMatchMedia = window.matchMedia;
+      // max-width: 760px does not match on a wide viewport.
       window.matchMedia = vi.fn().mockReturnValue({
-        matches: true,
+        matches: false,
         addEventListener: vi.fn(),
         removeEventListener: vi.fn(),
       }) as unknown as typeof window.matchMedia;
@@ -1047,8 +1082,10 @@ describe("UIStore", () => {
         expect(
           document.documentElement.classList.contains("high-contrast"),
         ).toBe(true);
+        // kit-ui's theme store persists high contrast under the key derived
+        // from the app's "theme" storage key.
         expect(setItem).toHaveBeenCalledWith(
-          "agentsview-high-contrast",
+          "theme-high-contrast",
           "true",
         );
         mod.ui.toggleHighContrast();

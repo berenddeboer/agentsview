@@ -32,8 +32,7 @@
     SignalCalibration,
     SignalSessionExample,
   } from "../../api/types.js";
-  import CopyButton from "../shared/CopyButton.svelte";
-  import OptionTypeahead from "../layout/OptionTypeahead.svelte";
+  import { CopyButton, IconButton, Typeahead } from "@kenn-io/kit-ui";
   import ProjectTypeahead from "../layout/ProjectTypeahead.svelte";
   import RangePicker from "../shared/RangePicker.svelte";
   import {
@@ -739,7 +738,7 @@
         value={analytics.project}
         onselect={handleProjectChange}
       />
-      <OptionTypeahead
+      <Typeahead
         options={agentOptions}
         value={analytics.agent}
         fallbackLabel={analytics.agent
@@ -752,7 +751,7 @@
       />
       <label class="toolbar-scope">
         <span>{m.insights_page_session_scope()}</span>
-        <OptionTypeahead
+        <Typeahead
           options={scopeOptions}
           value={analytics.automatedScope}
           fallbackLabel={m.insights_page_scope_no_automated()}
@@ -764,16 +763,16 @@
       </label>
     </div>
 
-    <button
-      class="icon-btn"
+    <IconButton
+      class="toolbar-refresh"
       onclick={handleRefresh}
       title={m.insights_page_refresh()}
-      aria-label={m.insights_page_refresh()}
+      ariaLabel={m.insights_page_refresh()}
     >
       <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
         <path d="M8 3a5 5 0 00-4.546 2.914.5.5 0 01-.908-.418A6 6 0 0114 8a.5.5 0 01-1 0 5 5 0 00-5-5zm4.546 7.086a.5.5 0 01.908.418A6 6 0 012 8a.5.5 0 011 0 5 5 0 005 5 5 5 0 004.546-2.914z"/>
       </svg>
-    </button>
+    </IconButton>
   </header>
 
   <main class="content">
@@ -1066,7 +1065,7 @@
       <div class="generated-controls">
         <label class="generated-control">
           <span>{m.insights_page_template_label()}</span>
-          <OptionTypeahead
+          <Typeahead
             options={templateOptions}
             value={insights.cannedKind}
             fallbackLabel={cannedKindLabel(insights.cannedKind)}
@@ -1079,7 +1078,7 @@
 
         <label class="generated-control">
           <span>{m.insights_page_generator_label()}</span>
-          <OptionTypeahead
+          <Typeahead
             options={generationAgentOptions}
             value={insights.agent}
             fallbackLabel={agentLabel(insights.agent)}
@@ -1340,44 +1339,33 @@
     white-space: nowrap;
   }
 
-  .filter-group :global(.typeahead),
-  .toolbar-scope :global(.typeahead),
-  .generated-control :global(.typeahead) {
+  .filter-group :global(.kit-typeahead),
+  .toolbar-scope :global(.kit-typeahead),
+  .generated-control :global(.kit-typeahead) {
     min-width: 0;
     max-width: none;
     width: 100%;
   }
 
-  .filter-group > :global(.typeahead:first-child) {
-    --typeahead-list-min-width: min(360px, calc(100vw - 32px));
+  /* The kit-ui Typeahead list pins to the trigger width, so size the
+     trigger itself (the old --typeahead-list-min-width knob is retired). */
+  .filter-group > :global(.kit-typeahead:first-child) {
     flex: 0 1 220px;
     min-width: 180px;
     max-width: 260px;
   }
 
-  .filter-group > :global(.typeahead:nth-child(2)) {
+  .filter-group > :global(.kit-typeahead:nth-child(2)) {
     flex: 0 0 120px;
   }
 
-  .toolbar-scope :global(.typeahead) {
+  .toolbar-scope :global(.kit-typeahead) {
     flex: 0 0 128px;
     width: 128px;
   }
 
-  .icon-btn {
-    width: 28px;
-    height: 28px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: var(--radius-sm);
-    color: var(--text-muted);
+  :global(.toolbar-refresh.kit-icon-button) {
     margin-left: auto;
-  }
-
-  .icon-btn:hover {
-    background: var(--bg-surface-hover);
-    color: var(--text-primary);
   }
 
   .content {
@@ -1387,7 +1375,7 @@
     padding: 18px;
     display: flex;
     flex-direction: column;
-    gap: 18px;
+    gap: var(--space-6);
   }
 
   .section-block {
@@ -1497,7 +1485,7 @@
   .summary-grid {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 10px;
+    gap: var(--space-5);
   }
 
   .summary-card,
@@ -1654,7 +1642,7 @@
     display: flex;
     align-items: baseline;
     justify-content: space-between;
-    gap: 10px;
+    gap: var(--space-4);
     padding: 10px;
     border-radius: var(--radius-sm);
     background: var(--bg-inset);
@@ -1679,7 +1667,7 @@
   .driver-row {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto auto auto;
-    gap: 10px;
+    gap: var(--space-4);
     align-items: baseline;
     width: 100%;
     min-height: 24px;
@@ -1724,7 +1712,7 @@
     height: 42px;
     display: flex;
     align-items: end;
-    gap: 3px;
+    gap: var(--space-1);
     padding: 6px 0 2px;
     border-top: 1px solid var(--border-muted);
     position: relative;
@@ -1782,7 +1770,7 @@
   .example-row {
     display: grid;
     grid-template-columns: minmax(90px, 0.35fr) 1fr;
-    gap: 10px;
+    gap: var(--space-4);
     font-size: 12px;
   }
 
@@ -1803,7 +1791,7 @@
 
   .evidence-panel {
     display: grid;
-    gap: 10px;
+    gap: var(--space-5);
     padding: 12px;
     background: var(--bg-surface);
     border: 1px solid var(--border-muted);
@@ -1887,13 +1875,13 @@
   .recommendation-list {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 10px;
+    gap: var(--space-5);
   }
 
   .recommendation {
     padding: 12px;
     display: grid;
-    gap: 7px;
+    gap: var(--space-3);
   }
 
   .recommendation strong {
@@ -1912,12 +1900,22 @@
     padding-top: 18px;
   }
 
+  /* The generated-archive grids have hard minimum column widths (controls:
+     180+130+240px; layout: a 240px list rail), so they collapse on available
+     CONTENT width via a container query (declared after both base grid rules
+     — same specificity, so it must win on source order) rather than the
+     viewport-width media gate below — with the sidebar open, a ~950px
+     viewport leaves far less room than a viewport breakpoint assumes. */
+  .generated-block {
+    container-type: inline-size;
+  }
+
   .generated-controls {
     display: grid;
     grid-template-columns:
       minmax(180px, 220px) minmax(130px, 160px)
       minmax(240px, 1fr) auto;
-    gap: 10px;
+    gap: var(--space-5);
     align-items: end;
     padding: 12px;
     background: var(--bg-surface);
@@ -1927,7 +1925,7 @@
 
   .generated-control {
     display: grid;
-    gap: 5px;
+    gap: var(--space-2);
     min-width: 0;
   }
 
@@ -2000,6 +1998,13 @@
     grid-template-columns: minmax(240px, 320px) 1fr;
     gap: 12px;
     align-items: start;
+  }
+
+  @container (max-width: 760px) {
+    .generated-controls,
+    .generated-layout {
+      grid-template-columns: 1fr;
+    }
   }
 
   .generated-list {
@@ -2113,13 +2118,12 @@
     flex-shrink: 0;
   }
 
-  .generated-actions :global(.insight-link-copy.copy-btn) {
-    opacity: 1;
+  .generated-actions :global(.insight-link-copy.kit-copy-btn) {
     border: 1px solid var(--border-muted);
     background: var(--bg-inset);
   }
 
-  .generated-actions :global(.insight-link-copy.copy-btn:hover) {
+  .generated-actions :global(.insight-link-copy.kit-copy-btn:hover) {
     border-color: var(--border-default);
   }
 
@@ -2295,14 +2299,14 @@
     }
   }
 
-  @media (max-width: 980px) {
+  @media (max-width: 900px) {
     .toolbar,
     .section-heading {
       align-items: stretch;
       flex-direction: column;
     }
 
-    .icon-btn {
+    :global(.toolbar-refresh.kit-icon-button) {
       margin-left: 0;
     }
 
@@ -2323,9 +2327,7 @@
 
     .summary-grid,
     .pattern-grid,
-    .recommendation-list,
-    .generated-controls,
-    .generated-layout {
+    .recommendation-list {
       grid-template-columns: 1fr;
     }
 

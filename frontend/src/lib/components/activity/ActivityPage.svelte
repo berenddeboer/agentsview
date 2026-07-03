@@ -15,11 +15,9 @@
     rangeToActivityParams,
     type PanelDateState,
   } from "../../stores/yokedDates.svelte.js";
-  import RefreshControl from "../shared/RefreshControl.svelte";
   import ProjectTypeahead from "../layout/ProjectTypeahead.svelte";
-  import OptionTypeahead, {
-    type TypeaheadOption,
-  } from "../layout/OptionTypeahead.svelte";
+  import { Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
+  import RefreshControl from "../shared/RefreshControl.svelte";
   import {
     addDays,
     endOfMonth,
@@ -314,7 +312,7 @@
     />
 
     <div class="toolbar-typeahead">
-      <OptionTypeahead
+      <Typeahead
         options={agentOptions}
         value={activity.agent}
         fallbackLabel={m.activity_all_agents()}
@@ -326,7 +324,7 @@
     </div>
 
     <div class="toolbar-typeahead">
-      <OptionTypeahead
+      <Typeahead
         options={machineOptions}
         value={activity.machine}
         fallbackLabel={m.activity_all_machines()}
@@ -338,7 +336,7 @@
     </div>
 
     <div class="toolbar-typeahead compact">
-      <OptionTypeahead
+      <Typeahead
         options={automationOptions}
         value={activity.automation}
         fallbackLabel={m.activity_all_sessions()}

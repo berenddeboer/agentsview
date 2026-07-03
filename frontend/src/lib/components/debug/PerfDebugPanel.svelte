@@ -1,5 +1,6 @@
 <script lang="ts">
   import { m } from "../../i18n/index.js";
+  import { IconButton } from "@kenn-io/kit-ui";
   import { perf } from "../../stores/perf.svelte.js";
   import { XIcon } from "../../icons.js";
 
@@ -30,7 +31,7 @@
 
 {#if perf.panelOpen}
   <section
-    class="perf-panel"
+    class="perf-panel kit-popover-card"
     aria-label={m.perf_aria_label()}
   >
     <header class="perf-header">
@@ -46,14 +47,14 @@
         >
           {m.perf_clear()}
         </button>
-        <button
-          class="icon-btn"
+        <IconButton
+          size="sm"
           onclick={() => (perf.panelOpen = false)}
           title={m.perf_close()}
-          aria-label={m.perf_close_aria()}
+          ariaLabel={m.perf_close_aria()}
         >
           <XIcon size="14" strokeWidth="2" aria-hidden="true" />
-        </button>
+        </IconButton>
       </div>
     </header>
 
@@ -107,10 +108,7 @@
     max-height: min(520px, calc(100vh - 96px));
     display: flex;
     flex-direction: column;
-    background: var(--bg-surface);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
-    box-shadow: var(--shadow-lg);
+    /* card chrome comes from the shared kit-popover-card class */
     color: var(--text-primary);
     overflow: hidden;
   }
@@ -142,27 +140,15 @@
     gap: 4px;
   }
 
-  .text-btn,
-  .icon-btn {
+  .text-btn {
     height: 24px;
     border-radius: var(--radius-sm);
     color: var(--text-muted);
-  }
-
-  .text-btn {
     padding: 0 8px;
     font-size: 11px;
   }
 
-  .icon-btn {
-    width: 24px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .text-btn:hover:not(:disabled),
-  .icon-btn:hover {
+  .text-btn:hover:not(:disabled) {
     background: var(--bg-surface-hover);
     color: var(--text-primary);
   }

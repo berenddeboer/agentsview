@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { expectActiveNavTab } from "./helpers/nav";
 
 test.describe("Usage page", () => {
   test.beforeEach(async ({ page }) => {
@@ -64,16 +65,16 @@ test.describe("Usage page", () => {
 
     // Click the first filter dropdown (Project).
     const trigger = page
-      .locator(".filter-dropdown .filter-trigger")
+      .locator(".usage-toolbar .kit-filter-dropdown__btn")
       .first();
     await trigger.click();
 
     // Dropdown panel should appear with rows.
     await expect(
-      page.locator(".dropdown-panel").first(),
+      page.locator(".usage-toolbar .kit-filter-dropdown__panel").first(),
     ).toBeVisible();
     await expect(
-      page.locator(".dropdown-row").first(),
+      page.locator(".usage-toolbar .kit-filter-dropdown__item").first(),
     ).toBeVisible();
   });
 
@@ -92,11 +93,11 @@ test.describe("Usage page", () => {
 
     // Open the project filter and exclude the first item.
     const trigger = page
-      .locator(".filter-dropdown .filter-trigger")
+      .locator(".usage-toolbar .kit-filter-dropdown__btn")
       .first();
     await trigger.click();
     await page
-      .locator(".dropdown-row")
+      .locator(".usage-toolbar .kit-filter-dropdown__item")
       .filter({ hasText: "project-delta" })
       .first()
       .click();
@@ -123,13 +124,13 @@ test.describe("Usage page", () => {
 
     // Open the project filter.
     const trigger = page
-      .locator(".filter-dropdown .filter-trigger")
+      .locator(".usage-toolbar .kit-filter-dropdown__btn")
       .first();
     await trigger.click();
 
     // Click "Deselect all".
     await page
-      .locator(".bulk-btn")
+      .locator(".usage-toolbar .kit-filter-dropdown__bulk-btn")
       .filter({ hasText: "Deselect all" })
       .first()
       .click();
@@ -139,7 +140,7 @@ test.describe("Usage page", () => {
 
     // Click "Select all".
     await page
-      .locator(".bulk-btn")
+      .locator(".usage-toolbar .kit-filter-dropdown__bulk-btn")
       .filter({ hasText: "Select all" })
       .first()
       .click();
@@ -148,14 +149,10 @@ test.describe("Usage page", () => {
     await expect(trigger).toContainText("All");
   });
 
-  test("top nav shows Usage button as active", async ({
+  test("top nav shows Usage as the active destination", async ({
     page,
   }) => {
-    const usageBtn = page.locator(
-      '.nav-btn[aria-label="Usage"]',
-    );
-    await expect(usageBtn).toBeVisible();
-    await expect(usageBtn).toHaveClass(/active/);
+    await expectActiveNavTab(page, "Usage");
   });
 
   test("URL updates when filter changes", async ({ page }) => {
@@ -166,11 +163,11 @@ test.describe("Usage page", () => {
 
     // Exclude a project.
     const trigger = page
-      .locator(".filter-dropdown .filter-trigger")
+      .locator(".usage-toolbar .kit-filter-dropdown__btn")
       .first();
     await trigger.click();
     await page
-      .locator(".dropdown-row")
+      .locator(".usage-toolbar .kit-filter-dropdown__item")
       .filter({ hasText: "project-delta" })
       .first()
       .click();

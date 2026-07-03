@@ -14,10 +14,10 @@ control.
   typeahead/combobox components for single-choice selectors unless there is a
   documented reason the native control is required.
 - Do not introduce component-specific control chrome such as `.foo-select`,
-  manual select chevrons, or one-off input/button height and padding rules when
-  a shared control or token should own the styling.
-- If a new control pattern is genuinely needed, add or extend a shared
-  component first, then use it from feature components.
+  manual select chevrons, or one-off input/button height and padding rules
+  when a shared control or token should own the styling.
+- If a new control pattern is genuinely needed, add or extend a shared component
+  first, then use it from feature components.
 
 ## Internationalization
 
@@ -50,27 +50,65 @@ control.
   content, or exported data formats.
 - Prefer parameterized locale messages for dynamic sentences instead of
   assembling user-visible strings from translated fragments.
-- Count-based user-facing messages with count-sensitive nouns must use
-  Paraglide plural variants instead of hard-coded strings such as
-  `{count} sessions` or `{count} calls`. Pass a numeric `count` for plural
-  selection, and pass a separate formatted label such as `countLabel` when the
-  displayed value needs locale formatting.
+- Count-based user-facing messages with count-sensitive nouns must use Paraglide
+  plural variants instead of hard-coded strings such as `{count} sessions` or
+  `{count} calls`. Pass a numeric `count` for plural selection, and pass a
+  separate formatted label such as `countLabel` when the displayed value needs
+  locale formatting.
 - Locale selection is preference-first, not URL-as-source. Paraglide is
-  configured with `["localStorage", "preferredLanguage", "baseLocale"]` because
-  the frontend is an embedded SPA without localized routes.
+  configured with `["localStorage", "preferredLanguage", "baseLocale"]`
+  because the frontend is an embedded SPA without localized routes.
 
 ## Current Shared Controls
 
-- `frontend/src/lib/components/layout/OptionTypeahead.svelte` is the default
-  compact single-select/typeahead control for bounded option lists.
-- `frontend/src/lib/components/layout/ProjectTypeahead.svelte` wraps
-  `OptionTypeahead` for project selection.
-- `frontend/src/lib/components/shared/RangePicker.svelte` owns date range
-  selection.
-- `frontend/src/lib/components/shared/RefreshControl.svelte` owns refresh
-  actions and freshness display.
+Most shared controls come from the `@kenn-io/kit-ui` library (imported as
+`import { ... } from "@kenn-io/kit-ui"`): Button, Chip, CopyButton, EmptyState,
+FilterDropdown, FindBar, IconButton, KbdBadge, Modal, RangePicker,
+RefreshControl, SegmentedControl, Spinner, StatusBar, StatusDot,
+Table/TableHeaderCell, TextInput/SearchInput, Tooltip, TopBar, and Typeahead.
+Shared components take pre-translated strings as props — call `m.*()` at the
+call site (or in a thin app wrapper) and pass the result.
+
+App-level glue that remains local:
+
+- `frontend/src/lib/components/layout/ProjectTypeahead.svelte` wraps kit-ui
+  `Typeahead` for project selection. Use kit-ui `Typeahead` directly for other
+  bounded option lists.
+- `frontend/src/lib/components/shared/RangePicker.svelte` is a thin wrapper over
+  kit-ui `DateRangePicker` that injects localized strings, the app locale, and
+  maps the app's selection API; date-range resolution stays in
+  `frontend/src/lib/components/shared/rangeSelection.ts`.
+- `frontend/src/lib/components/shared/RefreshControl.svelte` wraps kit-ui
+  `RefreshControl`, injecting the localized age formatter and app locale.
+- kit-ui components with a `locale` prop (DateRangePicker, RefreshControl,
+  Calendar) should receive `locale={getLocale()}` from the i18n facade so
+  their date formatting follows the app language setting instead of the
+  browser locale; the shared wrappers above do this.
+- `frontend/src/lib/components/content/SessionFindBar.svelte` wires kit-ui
+  `FindBar` to the in-session search store.
 - `frontend/src/lib/components/settings/SettingsSection.svelte` owns settings
   section framing.
+
+Relative date ranges follow kit-ui semantics: "Last N days" spans N calendar
+days inclusive of today. `presetRange()` (dateRangeSelector.ts) and
+`rollingRange()` (utils/dates.ts) must stay consistent with each other and with
+kit-ui's `RangePicker`, which seeds its Custom tab from the same math.
+
+### Known kit-ui gaps (tracked upstream)
+
+These gaps ship with the current kit-ui pin and are resolved by adding props
+upstream, then bumping the commit hash in `frontend/package.json` and threading
+the new props through the app wrappers. Do not work around them with unsupported
+props or forked styles.
+
+- `Modal`'s close-X `aria-label` is hardcoded English; needs a label prop.
+- `TopBar` cannot express "no active tab"; on routes that are not tabs
+  (settings), the first tab renders as current.
+
+Resolved upstream (adopted at the current pin): `RefreshControl` takes a
+`formatAge` prop, `DateRangePicker`'s `weekOfLabel` substitutes a `{date}`
+placeholder, and both take a `locale` prop — the shared wrappers inject all
+three.
 
 ## Legacy Exceptions
 

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { m } from "../../i18n/index.js";
   import {
+    getSessionStatus,
     sessions,
     type SessionGroupInput,
   } from "../../stores/sessions.svelte.js";
@@ -18,7 +19,8 @@
     UserRoundIcon,
     UsersRoundIcon,
   } from "../../icons.js";
-  import StatusDot from "../common/StatusDot.svelte";
+  import { StatusDot } from "@kenn-io/kit-ui";
+  import { sessionStatusLabel } from "../../utils/sessionStatus.js";
   import { router } from "../../stores/router.svelte.js";
 
   interface Props {
@@ -72,6 +74,8 @@
     selectMode = false,
     selected = false,
   }: Props = $props();
+
+  let sessionStatus = $derived(getSessionStatus(session, groupSessions));
 
   let isActive = $derived.by(() => {
     const aid = sessions.activeSessionId;
@@ -375,7 +379,7 @@
     </button>
   {/if}
 
-  <StatusDot {session} {groupSessions} size={6} />
+  <StatusDot status={sessionStatus} label={sessionStatusLabel(sessionStatus)} size={6} />
 
 
   <div class="session-info">
@@ -493,7 +497,7 @@
   .session-item {
     display: flex;
     align-items: center;
-    gap: 5px;
+    gap: var(--space-2);
     width: 100%;
     height: 42px;
     padding: 0 10px;
@@ -588,7 +592,7 @@
     display: flex;
     flex-direction: column;
     align-items: flex-end;
-    gap: 3px;
+    gap: var(--space-1);
     min-width: 0;
     flex-shrink: 0;
     margin-left: 4px;
@@ -759,7 +763,7 @@
     background: var(--bg-surface);
     border: 1px solid var(--border-default);
     border-radius: 6px;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+    box-shadow: var(--shadow-lg);
     padding: 4px 0;
     min-width: 120px;
   }

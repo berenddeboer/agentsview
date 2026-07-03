@@ -148,21 +148,16 @@ test.describe("Appearance accessibility", () => {
     const sp = new SessionsPage(page);
     await sp.goto();
 
-    const primaryButtonColors = await page.evaluate(() => {
-      const panel = document.createElement("div");
-      panel.className = "modal-panel";
-      panel.innerHTML = '<button class="modal-btn modal-btn-primary">Save</button>';
-      document.body.append(panel);
-      const button = panel.querySelector("button")!;
-      const styles = getComputedStyle(button);
-      const result = {
-        background: styles.backgroundColor,
-        foreground: styles.color,
-      };
-      panel.remove();
-      return result;
-    });
-    expectReadableContrast(primaryButtonColors);
+    // Measure a real kit-ui primary/solid Button (the Import modal's
+    // confirm action) rather than a synthetic element, so a kit-ui Button
+    // styling regression fails this test. Computed color/background still
+    // reflect the tone tokens while the button is disabled.
+    await page.locator(".import-btn").click();
+    const solidButton = page.locator(".kit-button--solid.kit-button--info");
+    await expect(solidButton).toBeVisible();
+    expectReadableContrast(await elementColors(solidButton));
+    await page.keyboard.press("Escape");
+    await expect(solidButton).toBeHidden();
 
     await sp.selectFirstSession();
     const agentBadge = page.locator(".agent-badge").first();

@@ -144,7 +144,7 @@ describe("MessageContent", () => {
       "var(--accent-blue-foreground)",
     );
     const copyButton = document.querySelector<HTMLButtonElement>(
-      "button.copy-btn",
+      "button.kit-copy-btn",
     );
     expect(copyButton?.getAttribute("aria-label")).toBe("复制消息");
     expect(copyButton?.getAttribute("title")).toBe("复制消息");
@@ -263,7 +263,7 @@ describe("MessageContent", () => {
 
     await tick();
     const copyButton = document.querySelector<HTMLButtonElement>(
-      'button.copy-btn[aria-label="Copy code block"]',
+      'button.kit-copy-btn[aria-label="Copy code block"]',
     );
     expect(copyButton).not.toBeNull();
     expect(copyButton!.querySelector("svg")).not.toBeNull();
@@ -279,6 +279,35 @@ describe("MessageContent", () => {
     );
     expect(copyButton!.querySelector("svg")).not.toBeNull();
     expect(copyButton!.textContent?.trim()).toBe("");
+
+    unmount(component);
+  });
+
+  // Regression guard for the kit-ui CopyButton adoption: the header copy
+  // button runs in controlled mode, so click forwarding into the app's
+  // clipboard util and the parent-owned copied aria/title state must keep
+  // working if kit-ui's API or class names change.
+  it("forwards the header copy click and reflects the copied state", async () => {
+    const component = mount(MessageContent, {
+      target: document.body,
+      props: { message: makeMessage() },
+    });
+
+    await tick();
+    const copyButton = document.querySelector<HTMLButtonElement>(
+      'button.kit-copy-btn[aria-label="Copy message"]',
+    );
+    expect(copyButton).not.toBeNull();
+    expect(copyButton!.getAttribute("title")).toBe("Copy message");
+
+    copyButton!.click();
+    await Promise.resolve();
+    await tick();
+
+    expect(copyToClipboardMock).toHaveBeenCalledTimes(1);
+    expect(copyToClipboardMock.mock.calls[0]?.[0]).toContain("Token summary");
+    expect(copyButton!.getAttribute("aria-label")).toBe("Copied message");
+    expect(copyButton!.getAttribute("title")).toBe("Copied!");
 
     unmount(component);
   });

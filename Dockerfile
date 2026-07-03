@@ -3,6 +3,11 @@ FROM --platform=$BUILDPLATFORM node:24-bookworm AS frontend-build
 WORKDIR /src/frontend
 
 COPY frontend/package.json frontend/package-lock.json ./
+
+# @kenn-io/kit-ui is a commit-pinned git dependency
+# (github:kenn-io/kit-ui#<commit> in frontend/package.json); the repository
+# is public, so npm clones it anonymously over HTTPS (git ships in the
+# node:bookworm image).
 RUN npm ci
 
 COPY frontend/ ./
