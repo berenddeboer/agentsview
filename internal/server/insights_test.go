@@ -368,6 +368,58 @@ func TestGenerateInsight_DefaultAgent(t *testing.T) {
 	assertBodyContains(t, w, "stub: no CLI")
 }
 
+func TestGenerateInsight_SessionValidation(t *testing.T) {
+	te := setup(t)
+
+	for _, body := range []string{
+		`{"type":"daily_activity","session_id":"missing","date_from":"2025-01-15","date_to":"2025-01-15"}`,
+		`{"type":"llm_canned","kind":"prompt_maturity_review","llm_opt_in":true,"session_id":"missing","date_from":"2025-01-15","date_to":"2025-01-15"}`,
+	} {
+		w := te.post(t, "/api/v1/insights/generate", body)
+		assertStatus(t, w, http.StatusBadRequest)
+		assertBodyContains(t, w, "session_id is only supported for agent_analysis")
+	}
+}
+
+func TestGenerateInsight_SingleSessionUsesSessionPrompt(t *testing.T) {
+	te := setupWithServerOpts(t, []server.Option{
+		server.WithGenerateFunc(func(
+			_ context.Context, agent, prompt string,
+		) (insight.Result, error) {
+			assert.Equal(t, "claude", agent)
+			assert.Contains(t, prompt, "## Session: session-1")
+			return insight.Result{
+				Agent:   "claude",
+				Content: "single-session analysis",
+			}, nil
+		}),
+	})
+	te.seedSession(t, "session-1", "my-app", 2)
+
+	w := te.post(t, "/api/v1/insights/generate",
+		`{"type":"agent_analysis","session_id":"session-1","date_from":"","date_to":""}`)
+	assertStatus(t, w, http.StatusOK)
+
+	events := parseSSE(w.Body.String())
+	require.NotEmpty(t, events)
+	require.Equal(t, "done", events[len(events)-1].Event)
+
+	var saved db.Insight
+	require.NoError(t, json.Unmarshal([]byte(events[len(events)-1].Data), &saved))
+	assert.Equal(t, "2025-01-15", saved.DateFrom)
+	assert.Equal(t, "2025-01-15", saved.DateTo)
+	assert.Equal(t, "my-app", *saved.Project)
+}
+
+func TestGenerateInsight_SingleSessionMissingSession(t *testing.T) {
+	te := setup(t)
+
+	w := te.post(t, "/api/v1/insights/generate",
+		`{"type":"agent_analysis","session_id":"missing","date_from":"","date_to":""}`)
+	assertStatus(t, w, http.StatusNotFound)
+	assertBodyContains(t, w, "session not found")
+}
+
 func TestGenerateInsight_PersistsWithReadOnlyStore(t *testing.T) {
 	dir := tempDirWithRetryCleanup(t)
 	dbPath := filepath.Join(dir, "test.db")

@@ -202,8 +202,29 @@ func (s *Server) humaGenerateInsight(
 		return nil, apiError(http.StatusBadRequest,
 			"invalid type: must be daily_activity, agent_analysis, or llm_canned")
 	}
+	if req.SessionID != "" && req.Type != "agent_analysis" {
+		return nil, apiError(http.StatusBadRequest,
+			"session_id is only supported for agent_analysis")
+	}
 	if req.Type == insight.CannedType {
 		return s.humaGenerateCannedInsight(req)
+	}
+	if req.SessionID != "" {
+		session, err := s.db.GetSession(ctx, req.SessionID)
+		if err != nil {
+			return nil, serverError(err)
+		}
+		if session == nil {
+			return nil, apiError(http.StatusNotFound, "session not found")
+		}
+		date := insightSessionDate(session)
+		if req.DateFrom == "" && date != "" {
+			req.DateFrom = date
+		}
+		if req.DateTo == "" && date != "" {
+			req.DateTo = date
+		}
+		req.Project = session.Project
 	}
 	if !timeutil.IsValidDate(req.DateFrom) {
 		return nil, apiError(http.StatusBadRequest,
@@ -253,6 +274,7 @@ func (s *Server) humaGenerateInsight(
 			DateTo:         req.DateTo,
 			Project:        req.Project,
 			Prompt:         req.Prompt,
+			SessionID:      req.SessionID,
 			AutomatedScope: req.AutomatedScope,
 		}
 		// Attach the activity summary for any valid range, single day
@@ -431,6 +453,29 @@ func (s *Server) humaGenerateInsight(
 		}
 		sendJSON("done", saved)
 	}}, nil
+}
+
+func insightSessionDate(session *db.Session) string {
+	if session == nil {
+		return ""
+	}
+	for _, ts := range []string{
+		insightStringValue(session.StartedAt),
+		insightStringValue(session.EndedAt),
+		session.CreatedAt,
+	} {
+		if len(ts) >= len("2006-01-02") {
+			return ts[:10]
+		}
+	}
+	return ""
+}
+
+func insightStringValue(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 // activityRangeSummary resolves the requested range into an activity report and
