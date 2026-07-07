@@ -788,7 +788,7 @@ func TestStoreAnalyticsUsageAndTrends(t *testing.T) {
 	assert.Equal(t, 2, counts.Total)
 	assert.Equal(t, 1, counts.ByProject["alpha"])
 
-	sessionUsage, err := store.GetSessionUsage(ctx, fixture.alphaID)
+	sessionUsage, err := store.GetSessionUsage(ctx, fixture.alphaID, true)
 	require.NoError(t, err)
 	require.NotNil(t, sessionUsage)
 	assert.True(t, sessionUsage.HasCost)
@@ -2191,12 +2191,25 @@ func TestUsageDedupesClaudeMessageIDs(t *testing.T) {
 	assert.Equal(t, 1, counts.ByProject["alpha"])
 	assert.NotContains(t, counts.ByProject, "beta")
 
-	sessionUsage, err := store.GetSessionUsage(ctx, "duck-usage-b")
+	sessionUsage, err := store.GetSessionUsage(ctx, "duck-usage-b", true)
 	require.NoError(t, err)
 	require.NotNil(t, sessionUsage)
 	assert.True(t, sessionUsage.HasCost)
 	assert.InDelta(t, 0.000033, sessionUsage.CostUSD, 0.000001)
 	assert.Equal(t, []string{"claude-test"}, sessionUsage.Models)
+	require.Len(t, sessionUsage.Breakdown, 1)
+	entry := sessionUsage.Breakdown[0]
+	assert.Equal(t, 1, entry.Ordinal)
+	require.NotNil(t, entry.MessageOrdinal)
+	assert.Equal(t, 0, *entry.MessageOrdinal)
+	assert.Equal(t, "message", entry.Source)
+	assert.Equal(t, "Prompt 1", entry.Label)
+	assert.Equal(t, "2026-01-13T00:01:00Z", entry.Timestamp)
+	assert.Equal(t, "claude-test", entry.Model)
+	assert.Equal(t, 1, entry.InputTokens)
+	assert.Equal(t, 2, entry.OutputTokens)
+	assert.True(t, entry.HasCost)
+	assert.InDelta(t, 0.000033, entry.CostUSD, 0.000001)
 }
 
 func TestUsageDedupesSourceUUIDWhenClaudePairIncomplete(t *testing.T) {
@@ -2253,12 +2266,15 @@ func TestUsageDedupesSourceUUIDWhenClaudePairIncomplete(t *testing.T) {
 	assert.Equal(t, 1, counts.ByProject["alpha"])
 	assert.NotContains(t, counts.ByProject, "beta")
 
-	sessionUsage, err := store.GetSessionUsage(ctx, "duck-usage-source-b")
+	sessionUsage, err := store.GetSessionUsage(ctx, "duck-usage-source-b", true)
 	require.NoError(t, err)
 	require.NotNil(t, sessionUsage)
 	assert.True(t, sessionUsage.HasCost)
 	assert.InDelta(t, 0.000033, sessionUsage.CostUSD, 0.000001)
 	assert.Equal(t, []string{"claude-test"}, sessionUsage.Models)
+	require.Len(t, sessionUsage.Breakdown, 1)
+	require.NotNil(t, sessionUsage.Breakdown[0].MessageOrdinal)
+	assert.Equal(t, 0, *sessionUsage.Breakdown[0].MessageOrdinal)
 }
 
 func TestUsagePreservesSessionSummaryUsageEventTokens(t *testing.T) {
@@ -2314,7 +2330,7 @@ func TestUsagePreservesSessionSummaryUsageEventTokens(t *testing.T) {
 	wantCost := (float64(rawInput)*1 + float64(rawOutput)*2) / 1_000_000
 	assert.InDelta(t, wantCost, top[0].Cost, 0.000001)
 
-	sessionUsage, err := store.GetSessionUsage(ctx, sessionID)
+	sessionUsage, err := store.GetSessionUsage(ctx, sessionID, true)
 	require.NoError(t, err)
 	require.NotNil(t, sessionUsage)
 	assert.Equal(t, rawOutput, sessionUsage.TotalOutputTokens)
@@ -2322,6 +2338,15 @@ func TestUsagePreservesSessionSummaryUsageEventTokens(t *testing.T) {
 	assert.True(t, sessionUsage.HasCost)
 	assert.InDelta(t, wantCost, sessionUsage.CostUSD, 0.000001)
 	assert.Equal(t, []string{"summary-model"}, sessionUsage.Models)
+	require.Len(t, sessionUsage.Breakdown, 1)
+	entry := sessionUsage.Breakdown[0]
+	assert.Equal(t, "session", entry.Source)
+	assert.Equal(t, "session", entry.Label)
+	assert.Nil(t, entry.MessageOrdinal)
+	assert.Equal(t, rawInput, entry.InputTokens)
+	assert.Equal(t, rawOutput, entry.OutputTokens)
+	assert.True(t, entry.HasCost)
+	assert.InDelta(t, wantCost, entry.CostUSD, 0.000001)
 }
 
 func TestDailyUsageCostsReasoningOnlyRows(t *testing.T) {
@@ -2367,11 +2392,20 @@ func TestDailyUsageCostsReasoningOnlyRows(t *testing.T) {
 	require.Len(t, top, 1)
 	assert.InDelta(t, wantCost, top[0].Cost, 0.000001)
 
-	sessionUsage, err := store.GetSessionUsage(ctx, sessionID)
+	sessionUsage, err := store.GetSessionUsage(ctx, sessionID, true)
 	require.NoError(t, err)
 	require.NotNil(t, sessionUsage)
 	assert.True(t, sessionUsage.HasCost)
 	assert.InDelta(t, wantCost, sessionUsage.CostUSD, 0.000001)
+	require.Len(t, sessionUsage.Breakdown, 1,
+		"reasoning-only rows must appear in the breakdown")
+	entry := sessionUsage.Breakdown[0]
+	assert.Equal(t, "provider", entry.Source)
+	assert.Zero(t, entry.OutputTokens,
+		"reasoning stays out of reported output tokens")
+	assert.True(t, entry.HasCost)
+	assert.InDelta(t, wantCost, entry.CostUSD, 0.000001,
+		"reasoning-only breakdown row bills at the output rate")
 }
 
 func TestDailyUsageCostsMessageReasoningTokens(t *testing.T) {
@@ -2411,11 +2445,20 @@ func TestDailyUsageCostsMessageReasoningTokens(t *testing.T) {
 	assert.Zero(t, daily.Totals.OutputTokens)
 	assert.InDelta(t, 0.002, daily.Totals.TotalCost, 0.000001)
 
-	sessionUsage, err := store.GetSessionUsage(ctx, "duck-message-reasoning")
+	sessionUsage, err := store.GetSessionUsage(ctx, "duck-message-reasoning", true)
 	require.NoError(t, err)
 	require.NotNil(t, sessionUsage)
 	assert.True(t, sessionUsage.HasCost)
 	assert.InDelta(t, 0.002, sessionUsage.CostUSD, 0.000001)
+	require.Len(t, sessionUsage.Breakdown, 1,
+		"reasoning-bearing message must appear in the breakdown")
+	entry := sessionUsage.Breakdown[0]
+	assert.Equal(t, "message", entry.Source)
+	assert.Equal(t, 1000, entry.InputTokens)
+	assert.Zero(t, entry.OutputTokens)
+	assert.True(t, entry.HasCost)
+	assert.InDelta(t, 0.002, entry.CostUSD, 0.000001,
+		"breakdown cost must include reasoning billed as output")
 }
 
 func TestDailyUsageCostsMixedOutputAndReasoningOnlyRows(t *testing.T) {
@@ -2474,11 +2517,20 @@ func TestDailyUsageCostsMixedOutputAndReasoningOnlyRows(t *testing.T) {
 	require.Len(t, top, 1)
 	assert.InDelta(t, wantCost, top[0].Cost, 0.000001)
 
-	sessionUsage, err := store.GetSessionUsage(ctx, sessionID)
+	sessionUsage, err := store.GetSessionUsage(ctx, sessionID, true)
 	require.NoError(t, err)
 	require.NotNil(t, sessionUsage)
 	assert.True(t, sessionUsage.HasCost)
 	assert.InDelta(t, wantCost, sessionUsage.CostUSD, 0.000001)
+	require.Len(t, sessionUsage.Breakdown, 2,
+		"both output and reasoning-only rows must appear in the breakdown")
+	breakdownCost := 0.0
+	for _, entry := range sessionUsage.Breakdown {
+		assert.True(t, entry.HasCost)
+		breakdownCost += entry.CostUSD
+	}
+	assert.InDelta(t, wantCost, breakdownCost, 0.000001,
+		"breakdown costs must sum to the session cost")
 }
 
 func TestUsageDedupPrefersInRangeDuplicate(t *testing.T) {

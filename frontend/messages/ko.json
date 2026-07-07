@@ -153,6 +153,21 @@
   "session_breadcrumb_copy_session_id_value": "세션 ID 복사: {id}",
   "session_breadcrumb_copied": "복사됨!",
   "session_breadcrumb_estimated_session_cost": "예상 세션 비용",
+  "session_breadcrumb_usage_breakdown_title": "세션 사용량 상세",
+  "session_breadcrumb_usage_breakdown_loading": "사용량 불러오는 중...",
+  "session_breadcrumb_usage_breakdown_steps": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countLabel}개 단계"
+      }
+    }
+  ],
   "session_breadcrumb_copy_link_to_session": "세션 링크 복사",
   "session_breadcrumb_show_session_analysis": "세션 분석 표시",
   "session_breadcrumb_hide_session_analysis": "세션 분석 숨기기",
@@ -544,6 +559,21 @@
   ],
   "analytics_tool_usage_trend_tooltip": "{date} | 총 {total} | {parts}",
   "analytics_tool_usage_empty": "도구 사용 데이터 없음",
+  "analytics_tool_usage_loading": "도구 사용 데이터 불러오는 중...",
+  "analytics_tool_usage_top_tools": "상위 도구",
+  "analytics_tool_usage_sessions": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "세션 {countLabel}개"
+      }
+    }
+  ],
   "analytics_by_category": "카테고리별",
   "analytics_by_agent": "에이전트별",
   "analytics_by_project": "프로젝트별",
