@@ -899,11 +899,19 @@ With an empty or short query (under 3 characters), the palette
 shows your 10 most recent sessions. Type to filter by project
 name or first message.
 
-### Full-Text Search
+### Search Modes
 
-Type 3 or more characters to search across all message content
-and session names. Results appear in real time with 300ms
-debounce.
+Type 3 or more characters to search in one of three modes:
+
+- **Full text** searches indexed message content with FTS5. It
+  also matches session display names and first messages.
+- **Semantic** ranks message content by meaning using the active
+  embeddings index.
+- **Hybrid** combines semantic and full-text rankings so that
+  both conceptual and exact-term matches can surface.
+
+The palette remembers the last mode you selected across openings
+and browser sessions. Results update after a 300ms typing pause.
 
 !!! tip
     For deeper searches across full transcripts — including tool
@@ -918,20 +926,30 @@ debounce.
 
 Results are grouped by session — each session shows its best
 matching result. This prevents a single long session from
-dominating the results list. The search also matches against
+dominating the results list. Full text also matches against
 session display names and first messages, so you can find
 sessions by title.
 
-Use the sort toggle in the palette header to switch between
-**Relevance** (best matches first) and **Recency** (newest
-sessions first).
+In Full text mode, use the sort toggle in the palette header to
+switch between **Relevance** (best matches first) and **Recency**
+(newest sessions first). Semantic and Hybrid use their backend
+rankings, so this toggle is hidden in those modes.
 
-Each result shows:
+Semantic and Hybrid require an enabled [`[vector]`](semantic-search.md#enabling-vector)
+configuration and an active embeddings index. If setup, index
+state, or the embeddings service prevents a search, the palette
+keeps the selected mode and shows actionable remediation rather
+than silently falling back to Full text.
 
-- **Role badge** — U (user) or A (assistant) in a colored box
-- **Snippet** — matching text with highlighted search terms
-- **Session name** — the session this result belongs to
-- **Project name** — right-aligned
+Results use a compact row:
+
+- **Full text** may show the session name and a sanitized snippet
+  with highlighted search terms.
+- **Semantic and Hybrid** lead with a plain-text matching snippet.
+  Content search does not return a session name or highlight
+  markup.
+- **All modes** show an agent-colored dot, project and result
+  time, and a copyable session ID.
 
 Select a result to jump to that session and scroll directly to
 the matching message.
