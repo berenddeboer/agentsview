@@ -1,0 +1,544 @@
+package extract
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+type scriptedResponse struct {
+	status       int
+	finishReason string
+	content      string
+	errorBody    string
+	noChoices    bool
+}
+
+func newScriptedServer(
+	t *testing.T, responses []scriptedResponse, requests *[]map[string]any,
+) *httptest.Server {
+	t.Helper()
+	var index atomic.Int64
+	return httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/chat/completions" {
+				t.Errorf("request path = %q, want /chat/completions", r.URL.Path)
+			}
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Errorf("decoding request: %v", err)
+			}
+			*requests = append(*requests, payload)
+			i := int(index.Add(1)) - 1
+			if i >= len(responses) {
+				t.Errorf("unexpected request %d", i)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			resp := responses[i]
+			if resp.status != 0 && resp.status != http.StatusOK {
+				w.WriteHeader(resp.status)
+				errorBody := resp.errorBody
+				if errorBody == "" {
+					errorBody = `{"error":"scripted"}`
+				}
+				_, _ = w.Write([]byte(errorBody))
+				return
+			}
+			choices := []map[string]any{{
+				"finish_reason": resp.finishReason,
+				"message": map[string]any{
+					"role":    "assistant",
+					"content": resp.content,
+				},
+			}}
+			if resp.noChoices {
+				choices = nil
+			}
+			body := map[string]any{
+				"choices": choices,
+				"usage": map[string]any{
+					"prompt_tokens":     7,
+					"completion_tokens": 3,
+				},
+			}
+			_ = json.NewEncoder(w).Encode(body)
+		}))
+}
+
+func entriesJSON(t *testing.T, titles ...string) string {
+	t.Helper()
+	entries := make([]map[string]any, 0, len(titles))
+	for _, title := range titles {
+		entries = append(entries, map[string]any{
+			"type": "fact", "title": title, "body": "b",
+			"entities": []string{},
+		})
+	}
+	raw, err := json.Marshal(map[string]any{"entries": entries})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+func testClient(url string) *Client {
+	return &Client{
+		BaseURL: url,
+		Model:   "test-model",
+		// Keep transient-retry backoff out of test wall-clock time.
+		RetryBackoff: time.Millisecond,
+		Request: RequestShape{
+			Temperature: 0,
+			MaxTokens:   100,
+			ExtraBody: map[string]any{
+				"chat_template_kwargs": map[string]any{
+					"enable_thinking": false,
+				},
+			},
+		},
+	}
+}
+
+func TestClientDistillParsesEntriesAndSendsShape(t *testing.T) {
+	var requests []map[string]any
+	server := newScriptedServer(t, []scriptedResponse{
+		{finishReason: "stop", content: entriesJSON(t, "one", "two")},
+	}, &requests)
+	defer server.Close()
+
+	entries, usage, err := testClient(server.URL).DistillWithRecovery(
+		context.Background(), "system prompt", "unit text", 3,
+	)
+	if err != nil {
+		t.Fatalf("DistillWithRecovery: %v", err)
+	}
+	if len(entries) != 2 || entries[0].Title != "one" {
+		t.Fatalf("entries = %+v", entries)
+	}
+	if usage.PromptTokens != 7 || usage.CompletionTokens != 3 {
+		t.Fatalf("usage = %+v", usage)
+	}
+	payload := requests[0]
+	if payload["temperature"] != float64(0) {
+		t.Fatalf("temperature = %v", payload["temperature"])
+	}
+	if payload["max_tokens"] != float64(100) {
+		t.Fatalf("max_tokens = %v", payload["max_tokens"])
+	}
+	if _, ok := payload["chat_template_kwargs"]; !ok {
+		t.Fatal("extra body must be merged into the request")
+	}
+	if _, ok := payload["response_format"]; !ok {
+		t.Fatal("constrained decoding must be requested")
+	}
+}
+
+func TestClientTrailingSlashBaseURL(t *testing.T) {
+	var requests []map[string]any
+	server := newScriptedServer(t, []scriptedResponse{
+		{finishReason: "stop", content: entriesJSON(t, "one")},
+	}, &requests)
+	defer server.Close()
+
+	client := testClient(server.URL + "/")
+	entries, _, err := client.DistillWithRecovery(
+		context.Background(), "p", "text", 3,
+	)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("entries=%v err=%v", entries, err)
+	}
+}
+
+func TestClientTruncationIsTypedSplitSignal(t *testing.T) {
+	// Truncation is never retried or compacted: any retry that caps the
+	// entry count would look complete while silently dropping entries, so
+	// the only recovery is the caller splitting the unit.
+	var requests []map[string]any
+	server := newScriptedServer(t, []scriptedResponse{
+		{finishReason: "length", content: ""},
+	}, &requests)
+	defer server.Close()
+
+	_, usage, err := testClient(server.URL).DistillWithRecovery(
+		context.Background(), "p", "unit text", 3,
+	)
+	if !errors.Is(err, ErrPersistentTruncation) {
+		t.Fatalf("err = %v, want ErrPersistentTruncation", err)
+	}
+	if len(requests) != 1 {
+		t.Fatalf("requests = %d, want 1 (truncation is deterministic)",
+			len(requests))
+	}
+	if usage.PromptTokens != 7 || usage.CompletionTokens != 3 {
+		t.Fatalf("usage = %+v, want the truncated attempt accounted", usage)
+	}
+}
+
+func TestClientBadRequestMentioningContextIsNotOverflow(t *testing.T) {
+	// "context" alone must not classify as overflow: 400s for unrelated
+	// problems can mention the word without describing an input-length
+	// error, and splitting the unit would loop uselessly.
+	var requests []map[string]any
+	server := newScriptedServer(t, []scriptedResponse{
+		{
+			status: http.StatusBadRequest,
+			errorBody: `{"error":{"message":"unknown field ` +
+				`\"chat_template_kwargs\" in request context"}}`,
+		},
+	}, &requests)
+	defer server.Close()
+
+	_, _, err := testClient(server.URL).DistillWithRecovery(
+		context.Background(), "p", "text", 3,
+	)
+	if err == nil || errors.Is(err, ErrContextOverflow) {
+		t.Fatalf("err = %v, must be a permanent non-overflow error", err)
+	}
+}
+
+func TestClientContextOverflowIsTyped(t *testing.T) {
+	var requests []map[string]any
+	server := newScriptedServer(t, []scriptedResponse{
+		{
+			status: http.StatusBadRequest,
+			errorBody: `{"error":{"message":"This model's maximum context ` +
+				`length is 32768 tokens."}}`,
+		},
+	}, &requests)
+	defer server.Close()
+
+	_, _, err := testClient(server.URL).DistillWithRecovery(
+		context.Background(), "p", "text", 3,
+	)
+	if !errors.Is(err, ErrContextOverflow) {
+		t.Fatalf("err = %v, want ErrContextOverflow", err)
+	}
+}
+
+func TestClientBadRequestOtherThanOverflowIsPermanent(t *testing.T) {
+	// A 400 for a wrong model name or malformed field must not masquerade as
+	// an overflow (which would make the caller split the unit), and it will
+	// not fix itself, so it must not burn the transient retry budget either.
+	var requests []map[string]any
+	server := newScriptedServer(t, []scriptedResponse{
+		{
+			status:    http.StatusBadRequest,
+			errorBody: `{"error":{"message":"model \"test-model\" not found"}}`,
+		},
+	}, &requests)
+	defer server.Close()
+
+	_, _, err := testClient(server.URL).DistillWithRecovery(
+		context.Background(), "p", "text", 3,
+	)
+	if err == nil {
+		t.Fatal("bad request must be an error")
+	}
+	if errors.Is(err, ErrContextOverflow) {
+		t.Fatalf("err = %v, must not be ErrContextOverflow", err)
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("err = %v, must carry the server detail", err)
+	}
+	if len(requests) != 1 {
+		t.Fatalf("requests = %d, want 1 (bad requests are not retried)",
+			len(requests))
+	}
+}
+
+func TestClientTruncationAfterTransientRetryAccountsUsage(t *testing.T) {
+	// A transient failure followed by truncation must surface the split
+	// signal with the usage of every attempt that reported it.
+	var requests []map[string]any
+	server := newScriptedServer(t, []scriptedResponse{
+		{status: http.StatusInternalServerError},
+		{finishReason: "length", content: ""},
+	}, &requests)
+	defer server.Close()
+
+	_, usage, err := testClient(server.URL).DistillWithRecovery(
+		context.Background(), "p", "text", 3,
+	)
+	if !errors.Is(err, ErrPersistentTruncation) {
+		t.Fatalf("err = %v, want ErrPersistentTruncation", err)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("requests = %d, want 2 (one transient retry, then "+
+			"truncation)", len(requests))
+	}
+	if usage.PromptTokens != 7 || usage.CompletionTokens != 3 {
+		t.Fatalf("usage = %+v, want the truncated attempt accounted", usage)
+	}
+}
+
+func TestClientRetriesTransientErrors(t *testing.T) {
+	var requests []map[string]any
+	server := newScriptedServer(t, []scriptedResponse{
+		{status: http.StatusInternalServerError},
+		{status: http.StatusTooManyRequests},
+		{finishReason: "stop", content: entriesJSON(t, "ok")},
+	}, &requests)
+	defer server.Close()
+
+	entries, _, err := testClient(server.URL).DistillWithRecovery(
+		context.Background(), "p", "text", 3,
+	)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("entries=%v err=%v", entries, err)
+	}
+	if len(requests) != 3 {
+		t.Fatalf("requests = %d, want 3 (5xx and 429 are transient)",
+			len(requests))
+	}
+}
+
+func TestClientPermanentHTTPStatusFailsFast(t *testing.T) {
+	// 401/403/404 will not fix themselves; retrying burns the budget and
+	// hides the configuration problem behind attempt noise.
+	var requests []map[string]any
+	server := newScriptedServer(t, []scriptedResponse{
+		{status: http.StatusUnauthorized},
+	}, &requests)
+	defer server.Close()
+
+	_, _, err := testClient(server.URL).DistillWithRecovery(
+		context.Background(), "p", "text", 3,
+	)
+	if err == nil {
+		t.Fatal("unauthorized must be an error")
+	}
+	if len(requests) != 1 {
+		t.Fatalf("requests = %d, want 1 (permanent statuses are not retried)",
+			len(requests))
+	}
+}
+
+func TestClientRejectsReservedExtraBodyKeys(t *testing.T) {
+	// A profile or override smuggling max_tokens through the extra body
+	// would bypass validation and desynchronize the generation fingerprint
+	// from the request actually sent.
+	var requests []map[string]any
+	server := newScriptedServer(t, nil, &requests)
+	defer server.Close()
+
+	client := testClient(server.URL)
+	client.Request.ExtraBody = map[string]any{"max_tokens": 5}
+	_, _, err := client.DistillWithRecovery(
+		context.Background(), "p", "text", 3,
+	)
+	if err == nil || !strings.Contains(err.Error(), "max_tokens") {
+		t.Fatalf("err = %v, want reserved-key rejection naming the key", err)
+	}
+	if len(requests) != 0 {
+		t.Fatalf("requests = %d, want 0 (rejected before any call)",
+			len(requests))
+	}
+}
+
+func TestIsContextOverflowDetail(t *testing.T) {
+	overflow := []string{
+		`{"error":{"code":"context_length_exceeded"}}`,
+		`This model's maximum context length is 32768 tokens.`,
+		`the request exceeds the available context size`,
+		`prompt is too long: 20000 tokens > 16000 maximum`,
+		`input is too large for the model context`,
+		`input length 5000 exceeds maximum 4096`,
+		`input tokens (6000) exceed the model maximum`,
+		`input tokens plus max_tokens exceed the model maximum`,
+		`prompt is too large for this model`,
+		`prompt too large: reduce the input`,
+	}
+	for _, body := range overflow {
+		if !isContextOverflowDetail(body) {
+			t.Errorf("must classify as overflow: %q", body)
+		}
+	}
+	// A length-related noun alone is not an overflow: these are validation
+	// errors that splitting the unit can never fix.
+	notOverflow := []string{
+		`{"error":{"message":"context window must be an integer"}}`,
+		`invalid input length parameter`,
+		`unknown field "context_size" in request`,
+		`max_tokens must be a positive integer`,
+		`max_tokens exceeds the maximum allowed value`,
+		`max_new_tokens exceeds the model limit`,
+		`Input validation error: max_tokens exceeds the maximum allowed value`,
+		`Input validation error: temperature exceeds the maximum allowed value`,
+		`invalid input: repetition_penalty exceeds maximum`,
+		`prompt_logprobs exceeds maximum allowed value`,
+		`max_tokens (5000) exceeds the context window (4096)`,
+		`model "test-model" not found`,
+	}
+	for _, body := range notOverflow {
+		if isContextOverflowDetail(body) {
+			t.Errorf("must not classify as overflow: %q", body)
+		}
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	if got := parseRetryAfter("2"); got != 2*time.Second {
+		t.Fatalf("parseRetryAfter(2) = %v", got)
+	}
+	future := time.Now().Add(5 * time.Second).UTC().Format(http.TimeFormat)
+	got := parseRetryAfter(future)
+	if got <= 0 || got > 5*time.Second {
+		t.Fatalf("parseRetryAfter(http-date) = %v", got)
+	}
+	for _, value := range []string{"", "garbage", "-3"} {
+		if got := parseRetryAfter(value); got != 0 {
+			t.Fatalf("parseRetryAfter(%q) = %v, want 0", value, got)
+		}
+	}
+}
+
+func TestClientChoicelessResponseAccountsUsageAcrossRetry(t *testing.T) {
+	// A choiceless 200 still reports token usage; the retry that recovers
+	// from it must not drop that cost from the accounting.
+	var requests []map[string]any
+	server := newScriptedServer(t, []scriptedResponse{
+		{noChoices: true},
+		{finishReason: "stop", content: entriesJSON(t, "ok")},
+	}, &requests)
+	defer server.Close()
+
+	entries, usage, err := testClient(server.URL).DistillWithRecovery(
+		context.Background(), "p", "text", 3,
+	)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("entries=%v err=%v", entries, err)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("requests = %d, want 2 (choiceless responses retry)",
+			len(requests))
+	}
+	if usage.PromptTokens != 14 || usage.CompletionTokens != 6 {
+		t.Fatalf("usage = %+v, want both attempts accounted (14/6)", usage)
+	}
+}
+
+func TestClientNonStopFinishReasonIsError(t *testing.T) {
+	// A content-filtered or otherwise cut-off response can still carry
+	// valid JSON with fewer (or zero) entries; accepting it would advance
+	// progress over silently lost facts. Only "stop" means complete.
+	var requests []map[string]any
+	server := newScriptedServer(t, []scriptedResponse{
+		{finishReason: "content_filter", content: entriesJSON(t, "partial")},
+	}, &requests)
+	defer server.Close()
+
+	_, _, err := testClient(server.URL).DistillWithRecovery(
+		context.Background(), "p", "text", 3,
+	)
+	if err == nil || !strings.Contains(err.Error(), "content_filter") {
+		t.Fatalf("err = %v, want an error naming the finish reason", err)
+	}
+	if len(requests) != 1 {
+		t.Fatalf("requests = %d, want 1 (a filtered response is "+
+			"deterministic)", len(requests))
+	}
+}
+
+func TestClientEmptyContentIsError(t *testing.T) {
+	// A model that burns its budget on hidden reasoning returns empty
+	// content with finish_reason stop; that must surface as an error, not
+	// as zero entries — and at temperature zero a same-input retry gives
+	// the same emptiness, so it must not be retried.
+	var requests []map[string]any
+	server := newScriptedServer(t, []scriptedResponse{
+		{finishReason: "stop", content: ""},
+	}, &requests)
+	defer server.Close()
+
+	_, _, err := testClient(server.URL).DistillWithRecovery(
+		context.Background(), "p", "text", 3,
+	)
+	if err == nil {
+		t.Fatal("empty content must be an error")
+	}
+	if len(requests) != 1 {
+		t.Fatalf("requests = %d, want 1 (deterministic emptiness is not retried)",
+			len(requests))
+	}
+}
+
+func TestClientRejectsSchemaViolatingContent(t *testing.T) {
+	// Constrained decoding is requested, but not every server enforces it;
+	// content that violates the schema must fail the unit instead of
+	// advancing progress with silently lost or malformed entries. At
+	// temperature zero the violation is deterministic, so no retry.
+	cases := map[string]string{
+		"empty object":        `{}`,
+		"null":                `null`,
+		"top-level array":     `[]`,
+		"unknown type":        `{"entries":[{"type":"story","title":"t","body":"b","entities":[]}]}`,
+		"blank title":         `{"entries":[{"type":"fact","title":" ","body":"b","entities":[]}]}`,
+		"blank body":          `{"entries":[{"type":"fact","title":"t","body":"","entities":[]}]}`,
+		"missing entities":    `{"entries":[{"type":"fact","title":"t","body":"b"}]}`,
+		"unknown field":       `{"entries":[{"type":"fact","title":"t","body":"b","entities":[],"extra":1}]}`,
+		"case-mismatched key": `{"Entries":[]}`,
+		"null entries":        `{"entries":null}`,
+		"null entry":          `{"entries":[null]}`,
+		"null title":          `{"entries":[{"type":"fact","title":null,"body":"b","entities":[]}]}`,
+		"null entity element": `{"entries":[{"type":"fact","title":"t","body":"b","entities":["a",null]}]}`,
+		"non-string entity":   `{"entries":[{"type":"fact","title":"t","body":"b","entities":[1]}]}`,
+		"trailing delimiter":  `{"entries":[]}]`,
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			var requests []map[string]any
+			server := newScriptedServer(t, []scriptedResponse{
+				{finishReason: "stop", content: content},
+			}, &requests)
+			defer server.Close()
+
+			entries, _, err := testClient(server.URL).DistillWithRecovery(
+				context.Background(), "p", "text", 3,
+			)
+			if err == nil {
+				t.Fatalf("content %q must be rejected, got entries %+v",
+					content, entries)
+			}
+			if len(requests) != 1 {
+				t.Fatalf("requests = %d, want 1 (schema violations are "+
+					"deterministic)", len(requests))
+			}
+		})
+	}
+}
+
+func TestClientAcceptsEmptyEntriesArray(t *testing.T) {
+	// A unit can legitimately yield nothing; an explicit empty array is
+	// schema-valid and distinct from a response that lacks the array.
+	var requests []map[string]any
+	server := newScriptedServer(t, []scriptedResponse{
+		{finishReason: "stop", content: `{"entries":[]}`},
+	}, &requests)
+	defer server.Close()
+
+	entries, _, err := testClient(server.URL).DistillWithRecovery(
+		context.Background(), "p", "text", 3,
+	)
+	if err != nil {
+		t.Fatalf("DistillWithRecovery: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("entries = %+v, want none", entries)
+	}
+}
+
+func TestSplitFloorChars(t *testing.T) {
+	if got := SplitFloorChars(50000); got != 2000 {
+		t.Fatalf("SplitFloorChars(50000) = %d, want 2000", got)
+	}
+	if got := SplitFloorChars(800); got != 100 {
+		t.Fatalf("SplitFloorChars(800) = %d, want 100", got)
+	}
+}
