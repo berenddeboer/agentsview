@@ -604,11 +604,15 @@ func TestSyncEngineOpenCodeSQLiteSameMtimeContentChangeUsesFingerprint(
 ) {
 	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
 	oc := createOpenCodeDB(t, env.opencodeDir)
+	oc.enableEventJournal(t)
 	oc.addProject(t, "proj", "/home/user/code/opencode-app")
 	seedOpenCodeSQLiteTextSession(
 		t, oc, "proj", "same-mtime-sqlite",
 		1779012000000, 1779012030000,
 		"original prompt", "original answer",
+	)
+	oc.addEvent(
+		t, "evt_001", "same-mtime-sqlite", "session.created.1", 1,
 	)
 
 	stats := env.engine.SyncAll(context.Background(), nil)
@@ -631,11 +635,11 @@ func TestSyncEngineOpenCodeSQLiteSameMtimeContentChangeUsesFingerprint(
 		"changed answer with same session mtime",
 		1779012000000,
 	)
+	oc.addEvent(
+		t, "evt_002", "same-mtime-sqlite", "message.part.updated.1", 2,
+	)
 
-	stats = env.engine.SyncAll(context.Background(), nil)
-	require.False(t, stats.Aborted, "second sync aborted: %+v", stats)
-	assert.Equal(t, 1, stats.Synced,
-		"same-mtime SQLite fingerprint changes must be rewritten")
+	env.engine.SyncPaths([]string{oc.path})
 	assertMessageContent(
 		t, env.db, sessionID,
 		"changed prompt with same session mtime",

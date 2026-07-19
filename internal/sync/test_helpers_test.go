@@ -169,6 +169,40 @@ type openCodeTestDB struct {
 	db   *sql.DB
 }
 
+func (oc *openCodeTestDB) enableEventJournal(t *testing.T) {
+	t.Helper()
+	_, err := oc.db.Exec(`
+		CREATE TABLE event_sequence (
+			aggregate_id TEXT PRIMARY KEY,
+			seq INTEGER NOT NULL
+		);
+		CREATE TABLE event (
+			id TEXT PRIMARY KEY,
+			aggregate_id TEXT NOT NULL,
+			seq INTEGER NOT NULL,
+			type TEXT NOT NULL,
+			data TEXT NOT NULL
+		);
+		CREATE UNIQUE INDEX event_aggregate_seq_idx
+			ON event (aggregate_id, seq);
+	`)
+	require.NoError(t, err, "create opencode event journal")
+}
+
+func (oc *openCodeTestDB) addEvent(
+	t *testing.T, id, sessionID, eventType string, seq int,
+) {
+	t.Helper()
+	_, err := oc.db.Exec(`
+		INSERT INTO event_sequence (aggregate_id, seq)
+		VALUES (?, ?)
+		ON CONFLICT (aggregate_id) DO UPDATE SET seq = excluded.seq;
+		INSERT INTO event (id, aggregate_id, seq, type, data)
+		VALUES (?, ?, ?, ?, '{"time":1}');
+	`, sessionID, seq, id, sessionID, seq, eventType)
+	require.NoError(t, err, "add opencode event")
+}
+
 type kiroSQLiteTestDB struct {
 	path string
 	db   *sql.DB

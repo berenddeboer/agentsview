@@ -13,6 +13,7 @@ import (
 )
 
 var _ Provider = (*openCodeFormatProvider)(nil)
+var _ ChangedPathCursorProvider = (*openCodeFormatProvider)(nil)
 
 // A SQLite WAL begins with a 32-byte header. Bytes beyond the header are
 // transaction frames, so a larger WAL can contain source changes worth
@@ -92,6 +93,41 @@ func (p *openCodeFormatProvider) SourcesForChangedPath(
 	req ChangedPathRequest,
 ) ([]SourceRef, error) {
 	return p.sources.SourcesForChangedPath(ctx, req)
+}
+
+func (p *openCodeFormatProvider) CurrentChangedPathCursors(
+	ctx context.Context,
+) ([]ChangedPathCursor, error) {
+	var cursors []ChangedPathCursor
+	seen := make(map[string]struct{})
+	for _, root := range p.sources.roots {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		dbPath := p.sources.spec.resolve(root).DBPath
+		if dbPath == "" {
+			continue
+		}
+		if _, ok := seen[dbPath]; ok {
+			continue
+		}
+		seen[dbPath] = struct{}{}
+		cursor, supported, err := OpenCodeEventCursor(dbPath)
+		if err != nil {
+			return nil, err
+		}
+		if supported {
+			cursors = append(cursors, ChangedPathCursor{Key: dbPath, Value: cursor})
+		}
+	}
+	return cursors, nil
+}
+
+func (p *openCodeFormatProvider) SourcesForChangedPathCursor(
+	ctx context.Context,
+	req ChangedPathRequest,
+) (ChangedPathCursorResult, error) {
+	return p.sources.SourcesForChangedPathCursor(ctx, req)
 }
 
 func (p *openCodeFormatProvider) FindSource(
@@ -398,6 +434,48 @@ func (s openCodeFormatSourceSet) SourcesForChangedPath(
 	return nil, nil
 }
 
+func (s openCodeFormatSourceSet) SourcesForChangedPathCursor(
+	ctx context.Context,
+	req ChangedPathRequest,
+) (ChangedPathCursorResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ChangedPathCursorResult{}, err
+	}
+	for _, root := range s.roots {
+		result, handled, err := s.sqliteDeltaForChangedPathInRoot(ctx, root, req)
+		if err != nil || handled {
+			return result, err
+		}
+	}
+	var fallbackCursors []ChangedPathCursor
+	for _, root := range s.roots {
+		rel, ok := relUnder(root, req.Path)
+		if !ok || (rel != s.spec.dbName && rel != s.spec.dbName+"-wal") {
+			continue
+		}
+		dbPath := filepath.Join(root, s.spec.dbName)
+		cursor, supported, cursorErr := OpenCodeEventCursor(dbPath)
+		if cursorErr != nil {
+			return ChangedPathCursorResult{}, cursorErr
+		}
+		if supported {
+			fallbackCursors = append(fallbackCursors, ChangedPathCursor{
+				Key: dbPath, Value: cursor,
+			})
+		}
+		break
+	}
+	sources, err := s.SourcesForChangedPath(ctx, req)
+	result := ChangedPathCursorResult{
+		Sources: sources,
+		Cursors: fallbackCursors,
+	}
+	if err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
 func (s openCodeFormatSourceSet) FindSource(
 	ctx context.Context,
 	req FindSourceRequest,
@@ -548,6 +626,106 @@ func (s openCodeFormatSourceSet) sqliteSources(
 		sources = append(sources, source)
 	}
 	return sources, nil
+}
+
+func (s openCodeFormatSourceSet) sqliteSourcesByID(
+	ctx context.Context,
+	root string,
+	dbPath string,
+	sessionIDs []string,
+) ([]SourceRef, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	metas, err := ListOpenCodeSessionMetaByID(dbPath, sessionIDs)
+	if err != nil {
+		return nil, err
+	}
+	sources := make([]SourceRef, 0, len(metas))
+	for _, meta := range metas {
+		if s.storageSessionExists(root, meta.SessionID) {
+			continue
+		}
+		if source, ok := s.sqliteSourceRefFromMeta(root, meta); ok {
+			source.ContentChanged = true
+			sources = append(sources, source)
+		}
+	}
+	return sources, nil
+}
+
+func (s openCodeFormatSourceSet) storageSessionExists(
+	root string,
+	sessionID string,
+) bool {
+	src := s.spec.resolve(root)
+	if src.Mode != OpenCodeSourceStorage {
+		return false
+	}
+	entries, err := os.ReadDir(src.SessionRoot)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if !isDirOrSymlink(entry, src.SessionRoot) {
+			continue
+		}
+		path := filepath.Join(src.SessionRoot, entry.Name(), sessionID+".json")
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			return true
+		}
+	}
+	return false
+}
+
+func (s openCodeFormatSourceSet) sqliteDeltaForChangedPathInRoot(
+	ctx context.Context,
+	root string,
+	req ChangedPathRequest,
+) (ChangedPathCursorResult, bool, error) {
+	rel, ok := relUnder(root, req.Path)
+	if !ok {
+		return ChangedPathCursorResult{}, false, nil
+	}
+	switch rel {
+	case s.spec.dbName + "-shm":
+		return ChangedPathCursorResult{}, true, nil
+	case s.spec.dbName + "-wal":
+		if !sqliteWALHasFrames(req.Path) {
+			return ChangedPathCursorResult{}, true, nil
+		}
+	case s.spec.dbName:
+	default:
+		return ChangedPathCursorResult{}, false, nil
+	}
+
+	dbPath := filepath.Join(root, s.spec.dbName)
+	if !IsRegularFile(dbPath) {
+		return ChangedPathCursorResult{}, true, nil
+	}
+	cursor, initialized := req.ChangeCursors[dbPath]
+	if !initialized {
+		return ChangedPathCursorResult{}, false, nil
+	}
+	delta, err := ListOpenCodeEventDelta(dbPath, cursor)
+	if err != nil {
+		return ChangedPathCursorResult{}, true, err
+	}
+	if !delta.Supported || !delta.Complete {
+		return ChangedPathCursorResult{}, false, nil
+	}
+	sources, err := s.sqliteSourcesByID(
+		ctx, root, dbPath, delta.SessionIDs,
+	)
+	return ChangedPathCursorResult{
+		Sources: sources,
+		Cursors: []ChangedPathCursor{{Key: dbPath, Value: delta.Cursor}},
+		Retries: []ChangedPathRetry{{
+			Key:     dbPath,
+			After:   delta.RetryAfter,
+			Pending: delta.RetryAfter > 0,
+		}},
+	}, true, err
 }
 
 // sqliteSourceRefFromMeta builds a SourceRef for a session row already listed

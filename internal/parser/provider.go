@@ -176,6 +176,11 @@ type SourceRef struct {
 	FingerprintKey string
 	// ProjectHint is advisory metadata for UI grouping and may be empty.
 	ProjectHint string
+	// ContentChanged means a durable provider journal identified this logical
+	// source as changed even if its coarse source metadata is unchanged. The
+	// engine bypasses pre-parse freshness gates but may still drop an identical
+	// parsed result by content fingerprint.
+	ContentChanged bool
 	// DiscoveryMTimeNS is an optional per-source modification time in Unix
 	// nanoseconds captured at discovery. Providers whose sources are virtual --
 	// a shared store fanned out to one source per session, where DisplayPath is
@@ -234,6 +239,46 @@ type ChangedPathRequest struct {
 	// still validate ownership against the changed path/watch root before
 	// emitting them.
 	StoredSourcePaths []string
+	// ChangeCursors are engine-owned high-water marks from the last successful
+	// sync. Providers with a durable source-side event journal may use them to
+	// classify only logical sources changed since that point. The map is
+	// read-only and keys are provider-defined stable source identities.
+	ChangeCursors map[string]string
+}
+
+// ChangedPathCursor is a provider-owned high-water mark. The engine promotes
+// it only after every source returned with it was processed successfully.
+type ChangedPathCursor struct {
+	Key   string
+	Value string
+}
+
+// ChangedPathRetry asks the engine to revisit a journal-backed container after
+// its current change stream has had time to settle. Pending false cancels an
+// earlier retry for the same key.
+type ChangedPathRetry struct {
+	Key     string
+	After   time.Duration
+	Pending bool
+}
+
+// ChangedPathCursorResult is changed-path classification plus cursors that may
+// be acknowledged when the resulting sync succeeds.
+type ChangedPathCursorResult struct {
+	Sources []SourceRef
+	Cursors []ChangedPathCursor
+	Retries []ChangedPathRetry
+}
+
+// ChangedPathCursorProvider is implemented by providers whose source format
+// exposes a durable change journal. It keeps changed-source scheduling
+// proportional to the changed batch rather than archive size.
+type ChangedPathCursorProvider interface {
+	CurrentChangedPathCursors(context.Context) ([]ChangedPathCursor, error)
+	SourcesForChangedPathCursor(
+		context.Context,
+		ChangedPathRequest,
+	) (ChangedPathCursorResult, error)
 }
 
 // FindSourceRequest contains lookup inputs and persisted source hints for

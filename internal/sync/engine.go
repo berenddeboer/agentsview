@@ -134,6 +134,13 @@ type Engine struct {
 	emitter                 Emitter
 	providerFactories       map[parser.AgentType]parser.ProviderFactory
 	providerMigrationModes  map[parser.AgentType]parser.ProviderMigrationMode
+	changedPathCursors      map[string]string
+	pendingChangedCursors   map[string]string
+	pendingChangedRetries   []parser.ChangedPathRetry
+	changedPathRetryMu      gosync.Mutex
+	changedPathRetryTimers  map[string]*time.Timer
+	changedPathRetryWG      gosync.WaitGroup
+	changedPathRetryClosed  bool
 	projectIdentityMu       gosync.Mutex
 	projectIdentityCache    map[string]projectIdentityCacheEntry
 	projectIdentityWritten  map[string]struct{}
@@ -292,6 +299,8 @@ func NewEngine(
 		emitter:                 cfg.Emitter,
 		providerFactories:       providerFactoryMap(providerFactories),
 		providerMigrationModes:  providerModes,
+		changedPathCursors:      make(map[string]string),
+		changedPathRetryTimers:  make(map[string]*time.Timer),
 		projectIdentityCache:    make(map[string]projectIdentityCacheEntry),
 		projectIdentityWritten:  make(map[string]struct{}),
 		startupMaintenanceReady: make(chan struct{}),
@@ -330,6 +339,7 @@ func NewEngine(
 // the scheduler. Call once when the engine's owner shuts down;
 // safe to call repeatedly.
 func (e *Engine) Close() {
+	e.stopChangedPathRetries()
 	e.signalSched.stop()
 }
 
@@ -598,27 +608,32 @@ func (e *Engine) SyncPathsContext(ctx context.Context, paths []string) {
 	if e.refuseWriteInForceParse("SyncPaths") {
 		return
 	}
-	// Capture container states before classifyPaths lists any session rows,
-	// matching the capture-before-discovery ordering of full syncs.
-	preContainerStates := e.captureSQLiteContainerStates()
-	files := e.classifyPaths(paths)
-	if len(files) == 0 {
-		return
-	}
-
-	e.syncMu.Lock()
-	// Defers run LIFO: the emit closure (declared first) runs AFTER
-	// syncMu.Unlock, so an Emitter implementation cannot widen the
-	// critical section or deadlock by re-entering sync code. The
-	// stats variable is captured by the closure and populated below.
 	var stats SyncStats
 	defer func() {
 		if stats.Synced > 0 {
 			e.emit("sessions")
 		}
 	}()
+	e.syncMu.Lock()
 	defer e.syncMu.Unlock()
 	defer e.clearCurrentProgress()
+
+	// Capture container states before classifyPaths lists any session rows,
+	// matching the capture-before-discovery ordering of full syncs.
+	preContainerStates := e.captureSQLiteContainerStates()
+	e.pendingChangedCursors = make(map[string]string)
+	e.pendingChangedRetries = make([]parser.ChangedPathRetry, 0)
+	files := e.classifyPaths(paths)
+	cursorUpdates := e.pendingChangedCursors
+	retryUpdates := e.pendingChangedRetries
+	e.pendingChangedCursors = nil
+	e.pendingChangedRetries = nil
+	if len(files) == 0 {
+		e.promoteChangedPathCursors(cursorUpdates)
+		e.updateChangedPathRetries(retryUpdates)
+		return
+	}
+
 	e.resetS3CodexIndexCache()
 
 	e.anomalies.reset()
@@ -636,6 +651,12 @@ func (e *Engine) SyncPathsContext(ctx context.Context, paths []string) {
 		syncWriteDefault,
 	)
 	e.finishSQLiteContainerPass(true, false)
+	if !stats.Aborted && stats.Failed == 0 && ctx.Err() == nil {
+		e.promoteChangedPathCursors(cursorUpdates)
+		e.updateChangedPathRetries(retryUpdates)
+	} else {
+		e.rescheduleFailedChangedPathRetries(retryUpdates)
+	}
 	e.anomalies.applyTo(&stats)
 	e.persistSkipCache()
 
@@ -695,6 +716,12 @@ func mergeChangedPathDiscoveredFile(
 	}
 	if current.ProviderSource == nil && next.ProviderSource != nil {
 		current.ProviderSource = next.ProviderSource
+	} else if current.ProviderSource != nil && next.ProviderSource != nil &&
+		next.ProviderSource.ContentChanged &&
+		!current.ProviderSource.ContentChanged {
+		merged := *current.ProviderSource
+		merged.ContentChanged = true
+		current.ProviderSource = &merged
 	}
 	return current
 }
@@ -773,15 +800,28 @@ func (e *Engine) classifyProviderChangedPath(
 					)
 				}
 			}
-			sources, err := provider.SourcesForChangedPath(
-				ctx,
-				parser.ChangedPathRequest{
-					Path:              path,
-					EventKind:         eventKind,
-					WatchRoot:         watchRoot,
-					StoredSourcePaths: storedSourcePaths,
-				},
+			req := parser.ChangedPathRequest{
+				Path:              path,
+				EventKind:         eventKind,
+				WatchRoot:         watchRoot,
+				StoredSourcePaths: storedSourcePaths,
+				ChangeCursors:     e.changedPathCursors,
+			}
+			var (
+				sources []parser.SourceRef
+				cursors []parser.ChangedPathCursor
+				retries []parser.ChangedPathRetry
+				err     error
 			)
+			if cursorProvider, ok := provider.(parser.ChangedPathCursorProvider); ok {
+				var result parser.ChangedPathCursorResult
+				result, err = cursorProvider.SourcesForChangedPathCursor(ctx, req)
+				sources = result.Sources
+				cursors = result.Cursors
+				retries = result.Retries
+			} else {
+				sources, err = provider.SourcesForChangedPath(ctx, req)
+			}
 			if err != nil {
 				if !errors.Is(err, parser.ErrUnsupportedProviderFeature) {
 					log.Printf(
@@ -790,6 +830,14 @@ func (e *Engine) classifyProviderChangedPath(
 					)
 				}
 				continue
+			}
+			if e.pendingChangedRetries != nil {
+				e.pendingChangedRetries = append(e.pendingChangedRetries, retries...)
+			}
+			for _, cursor := range cursors {
+				if cursor.Key != "" && e.pendingChangedCursors != nil {
+					e.pendingChangedCursors[cursor.Key] = cursor.Value
+				}
 			}
 			for _, source := range sources {
 				sourcePath := providerDiscoveredPath(source)
@@ -867,6 +915,117 @@ func providerChangedPathWatchRoots(
 		watchRoots = append(watchRoots, root)
 	}
 	return watchRoots
+}
+
+func (e *Engine) captureChangedPathCursors(
+	ctx context.Context,
+) (map[string]string, bool) {
+	cursors := make(map[string]string)
+	for agent, factory := range e.providerFactories {
+		if e.providerMigrationModes[agent] != parser.ProviderMigrationProviderAuthoritative ||
+			factory == nil {
+			continue
+		}
+		provider := factory.NewProvider(parser.ProviderConfig{
+			Roots:   e.agentDirs[agent],
+			Machine: e.machine,
+		})
+		cursorProvider, ok := provider.(parser.ChangedPathCursorProvider)
+		if !ok {
+			continue
+		}
+		current, err := cursorProvider.CurrentChangedPathCursors(ctx)
+		if err != nil {
+			log.Printf("%s provider change cursor: %v", agent, err)
+			return nil, false
+		}
+		for _, cursor := range current {
+			if cursor.Key != "" {
+				cursors[cursor.Key] = cursor.Value
+			}
+		}
+	}
+	return cursors, true
+}
+
+func (e *Engine) promoteChangedPathCursors(cursors map[string]string) {
+	for key, cursor := range cursors {
+		e.changedPathCursors[key] = cursor
+	}
+}
+
+func (e *Engine) updateChangedPathRetries(retries []parser.ChangedPathRetry) {
+	for _, retry := range retries {
+		if retry.Key == "" {
+			continue
+		}
+		e.changedPathRetryMu.Lock()
+		if e.changedPathRetryClosed {
+			e.changedPathRetryMu.Unlock()
+			return
+		}
+		if existing := e.changedPathRetryTimers[retry.Key]; existing != nil {
+			if existing.Stop() {
+				e.changedPathRetryWG.Done()
+			}
+			delete(e.changedPathRetryTimers, retry.Key)
+		}
+		if !retry.Pending {
+			e.changedPathRetryMu.Unlock()
+			continue
+		}
+		delay := retry.After
+		if delay <= 0 {
+			delay = time.Millisecond
+		}
+		e.changedPathRetryWG.Add(1)
+		key := retry.Key
+		var timer *time.Timer
+		timer = time.AfterFunc(delay, func() {
+			e.changedPathRetryMu.Lock()
+			if e.changedPathRetryTimers[key] == timer {
+				delete(e.changedPathRetryTimers, key)
+			}
+			closed := e.changedPathRetryClosed
+			e.changedPathRetryMu.Unlock()
+			if !closed {
+				e.SyncPaths([]string{key})
+			}
+			e.changedPathRetryWG.Done()
+		})
+		e.changedPathRetryTimers[key] = timer
+		e.changedPathRetryMu.Unlock()
+	}
+}
+
+func (e *Engine) rescheduleFailedChangedPathRetries(
+	retries []parser.ChangedPathRetry,
+) {
+	for i := range retries {
+		if retries[i].Pending {
+			continue
+		}
+		retries[i].Pending = true
+		retries[i].After = time.Second
+	}
+	e.updateChangedPathRetries(retries)
+}
+
+func (e *Engine) stopChangedPathRetries() {
+	e.changedPathRetryMu.Lock()
+	if e.changedPathRetryClosed {
+		e.changedPathRetryMu.Unlock()
+		return
+	}
+	e.changedPathRetryClosed = true
+	for key, timer := range e.changedPathRetryTimers {
+		if timer.Stop() {
+			e.changedPathRetryWG.Done()
+		}
+		delete(e.changedPathRetryTimers, key)
+	}
+	e.changedPathRetryMu.Unlock()
+	e.changedPathRetryWG.Wait()
 }
 
 func providerChangedPathForceParse(
@@ -2465,6 +2624,14 @@ func (e *Engine) syncAllLocked(
 		Detail: "Discovering sessions",
 	})
 
+	var (
+		fullChangeCursors map[string]string
+		changeCursorsOK   bool
+	)
+	if scope == nil && since.IsZero() {
+		fullChangeCursors, changeCursorsOK = e.captureChangedPathCursors(ctx)
+	}
+
 	// Container states must be captured BEFORE discovery lists any session
 	// rows, so a promoted state can never be newer than the discovered
 	// session set (see captureSQLiteContainerStates).
@@ -2722,6 +2889,9 @@ func (e *Engine) syncAllLocked(
 
 	if recordSyncState && providerFailures == 0 {
 		e.recordSyncFinished()
+	}
+	if scope == nil && changeCursorsOK && providerFailures == 0 && stats.Failed == 0 {
+		e.changedPathCursors = fullChangeCursors
 	}
 	// Emission happens in SyncAll / SyncAllSince after syncMu is
 	// released; syncAllLocked runs under the caller's lock.
@@ -4350,6 +4520,7 @@ func (e *Engine) processProviderFile(
 	ctx context.Context,
 	file parser.DiscoveredFile,
 ) (processResult, bool) {
+	contentChanged := file.ProviderSource != nil && file.ProviderSource.ContentChanged
 	mode := e.providerMigrationModes[file.Agent]
 	usesProvider := processFileUsesProvider(file.Agent)
 	if mode != parser.ProviderMigrationProviderAuthoritative && !usesProvider {
@@ -4369,7 +4540,7 @@ func (e *Engine) processProviderFile(
 	// provably has not changed since the last fully verified pass, none
 	// of its sessions can have changed, so skip before paying for the
 	// per-session fingerprint (a DB open per source) and parse.
-	if e.sqliteContainerSourceFresh(file) {
+	if !contentChanged && e.sqliteContainerSourceFresh(file) {
 		return processResult{skip: true}, true
 	}
 
@@ -4444,7 +4615,7 @@ func (e *Engine) processProviderFile(
 
 	verifiedCapture, verifiedMtime, verifiedFresh, verifiedStateOK :=
 		e.verifiedProviderSourceState(provider, source, file)
-	if verifiedStateOK && verifiedFresh {
+	if !contentChanged && verifiedStateOK && verifiedFresh {
 		if e.verifiedProviderSourceFreshInDB(
 			source, verifiedCapture.signature.size, verifiedMtime,
 		) {
@@ -4465,7 +4636,7 @@ func (e *Engine) processProviderFile(
 	sourceForceReplace := false
 	if mtime, fresh, forceReplace, contentVerified := e.providerSingleSessionFresh(
 		ctx, provider, source, file,
-	); fresh {
+	); fresh && !contentChanged {
 		if !verifiedStateOK || contentVerified {
 			if verifiedStateOK {
 				e.promoteVerifiedSource(verifiedCapture)
@@ -4482,7 +4653,7 @@ func (e *Engine) processProviderFile(
 	} else if forceReplace {
 		sourceForceReplace = true
 	}
-	if freshMtime, fresh := e.providerSourceFreshBeforeFingerprint(source, file); fresh {
+	if freshMtime, fresh := e.providerSourceFreshBeforeFingerprint(source, file); fresh && !contentChanged {
 		return processResult{
 			skip:  true,
 			mtime: freshMtime,
@@ -4506,7 +4677,7 @@ func (e *Engine) processProviderFile(
 	}
 	cacheKey := providerProcessCacheKey(file, source, fingerprint)
 	cacheSkip := e.shouldCacheSkip(file)
-	if cacheSkip && !e.forceParse && !file.ForceParse {
+	if cacheSkip && !contentChanged && !e.forceParse && !file.ForceParse {
 		e.skipMu.RLock()
 		cachedMtime, cached := e.skipCache[cacheKey]
 		e.skipMu.RUnlock()
@@ -4540,7 +4711,7 @@ func (e *Engine) processProviderFile(
 			}
 		}
 	}
-	if cacheSkip && e.shouldSkipProviderSource(file, source, fingerprint) {
+	if cacheSkip && !contentChanged && e.shouldSkipProviderSource(file, source, fingerprint) {
 		return processResult{
 			skip:      true,
 			mtime:     fingerprint.MTimeNS,
@@ -4572,7 +4743,7 @@ func (e *Engine) processProviderFile(
 	// engine). For Codex this also folds in the session_index.jsonl sidecar:
 	// a shared index mtime bump that did not change this session's title must
 	// not trigger a reparse.
-	if !incForceReplace && !e.forceParse && !file.ForceParse &&
+	if !contentChanged && !incForceReplace && !e.forceParse && !file.ForceParse &&
 		e.shouldSkipProviderSourceByDB(file, fingerprint) {
 		if verifiedStateOK {
 			e.promoteVerifiedSource(verifiedCapture)
@@ -4596,7 +4767,7 @@ func (e *Engine) processProviderFile(
 	// a provider whose fingerprint mtime differs from the stored value simply
 	// reparses, matching the prior behavior. Claude and Cowork have their own
 	// earlier freshness checks; this is the generic fallback for the rest.
-	if !incForceReplace && !e.forceParse && !file.ForceParse &&
+	if !contentChanged && !incForceReplace && !e.forceParse && !file.ForceParse &&
 		e.providerSourceUnchangedInDB(source, fingerprint) {
 		return processResult{
 			skip:      true,

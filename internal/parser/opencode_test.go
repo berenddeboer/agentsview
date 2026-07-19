@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
@@ -77,6 +78,25 @@ CREATE TABLE part (
 );
 `
 
+const openCodeEventSchema = `
+CREATE TABLE event_sequence (
+	aggregate_id TEXT PRIMARY KEY,
+	seq INTEGER NOT NULL
+);
+CREATE TABLE event (
+	id TEXT PRIMARY KEY,
+	aggregate_id TEXT NOT NULL,
+	seq INTEGER NOT NULL,
+	type TEXT NOT NULL,
+	data TEXT NOT NULL,
+	FOREIGN KEY (aggregate_id) REFERENCES event_sequence(aggregate_id)
+);
+CREATE INDEX event_aggregate_type_seq_idx
+	ON event (aggregate_id, type, seq);
+CREATE UNIQUE INDEX event_aggregate_seq_idx
+	ON event (aggregate_id, seq);
+`
+
 func assertEq[T comparable](t *testing.T, name string, got, want T) {
 	t.Helper()
 	assert.Equal(t, want, got, name)
@@ -85,6 +105,32 @@ func assertEq[T comparable](t *testing.T, name string, got, want T) {
 type OpenCodeSeeder struct {
 	db *sql.DB
 	t  *testing.T
+}
+
+func seedOpenCodeEventJournal(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.Exec(openCodeEventSchema)
+	require.NoError(t, err, "create opencode event journal")
+}
+
+func addOpenCodeEvent(
+	t *testing.T,
+	db *sql.DB,
+	id, aggregateID, eventType string,
+	seq int,
+) {
+	t.Helper()
+	_, err := db.Exec(`
+		INSERT INTO event_sequence (aggregate_id, seq)
+		VALUES (?, ?)
+		ON CONFLICT (aggregate_id) DO UPDATE SET seq = excluded.seq
+	`, aggregateID, seq)
+	require.NoError(t, err, "update opencode event sequence")
+	_, err = db.Exec(`
+		INSERT INTO event (id, aggregate_id, seq, type, data)
+		VALUES (?, ?, ?, ?, '{"time":1}')
+	`, id, aggregateID, seq, eventType)
+	require.NoError(t, err, "add opencode event")
 }
 
 func (s *OpenCodeSeeder) AddProject(id, worktree string) {
@@ -226,6 +272,246 @@ func writeOpenCodeStorageFile(
 	raw, err := json.Marshal(data)
 	require.NoError(t, err, "marshal %s", path)
 	require.NoError(t, os.WriteFile(path, raw, 0o644), "write %s", path)
+}
+
+func TestListOpenCodeEventDelta(t *testing.T) {
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+	seedOpenCodeEventJournal(t, db)
+	seeder.AddProject("prj_events", "/tmp/events")
+	seeder.AddSession("ses_a", "prj_events", "", "A", 1, 2)
+	seeder.AddSession("ses_b", "prj_events", "", "B", 1, 2)
+	addOpenCodeEvent(t, db, "evt_001", "ses_a", "session.created.1", 1)
+
+	cursor, supported, err := OpenCodeEventCursor(dbPath)
+	require.NoError(t, err)
+	require.True(t, supported)
+	decoded, err := decodeOpenCodeEventCursor(cursor)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), decoded.RowID)
+
+	addOpenCodeEvent(t, db, "evt_002", "ses_b", "message.updated.1", 1)
+	addOpenCodeEvent(t, db, "evt_003", "ses_b", "message.part.updated.1", 2)
+	addOpenCodeEvent(t, db, "evt_004", "ses_a", "session.updated.1", 2)
+
+	delta, err := ListOpenCodeEventDelta(dbPath, cursor)
+	require.NoError(t, err)
+	assert.True(t, delta.Supported)
+	assert.True(t, delta.Complete)
+	decoded, err = decodeOpenCodeEventCursor(delta.Cursor)
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), decoded.RowID)
+	assert.Equal(t, []string{"ses_a", "ses_b"}, delta.SessionIDs)
+}
+
+func TestListOpenCodeEventDeltaCoalescesActiveSessionsIndependently(t *testing.T) {
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+	seedOpenCodeEventJournal(t, db)
+	seeder.AddProject("prj_events", "/tmp/events")
+	seeder.AddSession("ses_a", "prj_events", "", "A", 1, 2)
+	seeder.AddSession("ses_b", "prj_events", "", "B", 1, 2)
+	addOpenCodeEvent(t, db, "evt_001", "ses_a", "session.created.1", 1)
+	cursor, supported, err := OpenCodeEventCursor(dbPath)
+	require.NoError(t, err)
+	require.True(t, supported)
+
+	now := time.UnixMilli(10_000)
+	addOpenCodeEvent(t, db, "evt_002", "ses_a", "message.updated.1", 2)
+	_, err = db.Exec("UPDATE event SET data = ? WHERE id = ?", `{}`, "evt_002")
+	require.NoError(t, err)
+	delta, err := listOpenCodeEventDeltaAt(dbPath, cursor, now)
+	require.NoError(t, err)
+	assert.Empty(t, delta.SessionIDs)
+	decoded, err := decodeOpenCodeEventCursor(delta.Cursor)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int64{"ses_a": now.UnixMilli()}, decoded.Pending)
+
+	bChangedAt := now.Add(openCodeEventQuietPeriod)
+	addOpenCodeEvent(t, db, "evt_003", "ses_b", "message.part.updated.1", 1)
+	_, err = db.Exec(
+		"UPDATE event SET data = ? WHERE id = ?",
+		fmt.Sprintf(`{"time":%d}`, bChangedAt.UnixMilli()),
+		"evt_003",
+	)
+	require.NoError(t, err)
+	delta, err = listOpenCodeEventDeltaAt(dbPath, delta.Cursor, bChangedAt)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"ses_a"}, delta.SessionIDs)
+	decoded, err = decodeOpenCodeEventCursor(delta.Cursor)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int64{"ses_b": bChangedAt.UnixMilli()}, decoded.Pending)
+
+	delta, err = listOpenCodeEventDeltaAt(
+		dbPath,
+		delta.Cursor,
+		bChangedAt.Add(openCodeEventQuietPeriod),
+	)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"ses_b"}, delta.SessionIDs)
+	decoded, err = decodeOpenCodeEventCursor(delta.Cursor)
+	require.NoError(t, err)
+	assert.Empty(t, decoded.Pending)
+}
+
+func TestListOpenCodeEventDeltaFlushesMessageCheckpoint(t *testing.T) {
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+	seedOpenCodeEventJournal(t, db)
+	seeder.AddProject("prj_events", "/tmp/events")
+	seeder.AddSession("ses_a", "prj_events", "", "A", 1, 2)
+	addOpenCodeEvent(t, db, "evt_001", "ses_a", "session.created.1", 1)
+	cursor, supported, err := OpenCodeEventCursor(dbPath)
+	require.NoError(t, err)
+	require.True(t, supported)
+
+	now := time.UnixMilli(10_000)
+	addOpenCodeEvent(t, db, "evt_002", "ses_a", "message.part.updated.1", 2)
+	_, err = db.Exec("UPDATE event SET data = ? WHERE id = ?", `{}`, "evt_002")
+	require.NoError(t, err)
+	delta, err := listOpenCodeEventDeltaAt(dbPath, cursor, now)
+	require.NoError(t, err)
+	require.Empty(t, delta.SessionIDs)
+
+	addOpenCodeEvent(t, db, "evt_003", "ses_a", "message.updated.1", 3)
+	_, err = db.Exec(
+		"UPDATE event SET data = ? WHERE id = ?",
+		`{"info":{"role":"assistant","time":{"completed":10000}}}`,
+		"evt_003",
+	)
+	require.NoError(t, err)
+	delta, err = listOpenCodeEventDeltaAt(dbPath, delta.Cursor, now)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"ses_a"}, delta.SessionIDs)
+	decoded, err := decodeOpenCodeEventCursor(delta.Cursor)
+	require.NoError(t, err)
+	assert.Empty(t, decoded.Pending)
+}
+
+func TestListOpenCodeEventDeltaFallsBackForUnjournaledChangeWhilePending(t *testing.T) {
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+	seedOpenCodeEventJournal(t, db)
+	seeder.AddProject("prj_events", "/tmp/events")
+	seeder.AddSession("ses_a", "prj_events", "", "A", 1, 2)
+	addOpenCodeEvent(t, db, "evt_001", "ses_a", "session.created.1", 1)
+	cursor, supported, err := OpenCodeEventCursor(dbPath)
+	require.NoError(t, err)
+	require.True(t, supported)
+
+	now := time.Now()
+	addOpenCodeEvent(t, db, "evt_002", "ses_a", "message.part.updated.1", 2)
+	_, err = db.Exec(
+		"UPDATE event SET data = ? WHERE id = ?",
+		fmt.Sprintf(`{"time":%d}`, now.UnixMilli()),
+		"evt_002",
+	)
+	require.NoError(t, err)
+	delta, err := listOpenCodeEventDeltaAt(dbPath, cursor, now)
+	require.NoError(t, err)
+	require.Empty(t, delta.SessionIDs)
+	require.Positive(t, delta.RetryAfter)
+
+	_, err = db.Exec("UPDATE session SET title = 'changed without event' WHERE id = 'ses_a'")
+	require.NoError(t, err)
+	delta, err = listOpenCodeEventDeltaAt(dbPath, delta.Cursor, now)
+	require.NoError(t, err)
+	assert.True(t, delta.Supported)
+	assert.False(t, delta.Complete)
+}
+
+func TestListOpenCodeEventDeltaPreservesDeletedSessionIdentity(t *testing.T) {
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+	seedOpenCodeEventJournal(t, db)
+	seeder.AddProject("prj_events", "/tmp/events")
+	seeder.AddSession("ses_deleted", "prj_events", "", "Deleted", 1, 2)
+	addOpenCodeEvent(t, db, "evt_001", "ses_deleted", "session.created.1", 1)
+	cursor, supported, err := OpenCodeEventCursor(dbPath)
+	require.NoError(t, err)
+	require.True(t, supported)
+
+	_, err = db.Exec("DELETE FROM session WHERE id = ?", "ses_deleted")
+	require.NoError(t, err)
+	addOpenCodeEvent(t, db, "evt_002", "ses_deleted", "session.deleted.1", 2)
+
+	delta, err := ListOpenCodeEventDelta(dbPath, cursor)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"ses_deleted"}, delta.SessionIDs)
+	metas, err := ListOpenCodeSessionMetaByID(dbPath, delta.SessionIDs)
+	require.NoError(t, err)
+	assert.Empty(t, metas, "deleted sessions stay archived and produce no parse source")
+}
+
+func TestListOpenCodeEventDeltaFallsBackForNonSessionAggregate(t *testing.T) {
+	dbPath, _, db := newTestDB(t)
+	defer db.Close()
+	seedOpenCodeEventJournal(t, db)
+	addOpenCodeEvent(t, db, "evt_001", "ses_a", "session.updated.1", 1)
+	addOpenCodeEvent(t, db, "evt_002", "prj_a", "project.updated.1", 1)
+
+	delta, err := ListOpenCodeEventDelta(dbPath, "evt_001")
+	require.NoError(t, err)
+	assert.True(t, delta.Supported)
+	assert.False(t, delta.Complete)
+}
+
+func TestListOpenCodeEventDeltaFallsBackWhenJournalRegresses(t *testing.T) {
+	dbPath, _, db := newTestDB(t)
+	defer db.Close()
+	seedOpenCodeEventJournal(t, db)
+	addOpenCodeEvent(t, db, "evt_001", "ses_deleted", "session.created.1", 1)
+	cursor, supported, err := OpenCodeEventCursor(dbPath)
+	require.NoError(t, err)
+	require.True(t, supported)
+
+	_, err = db.Exec(`
+		DELETE FROM event WHERE aggregate_id = 'ses_deleted';
+		DELETE FROM event_sequence WHERE aggregate_id = 'ses_deleted';
+	`)
+	require.NoError(t, err)
+	delta, err := ListOpenCodeEventDelta(dbPath, cursor)
+	require.NoError(t, err)
+	assert.True(t, delta.Supported)
+	assert.False(t, delta.Complete,
+		"journal deletion and rowid reuse must force full reconciliation")
+}
+
+func TestListOpenCodeEventDeltaFallsBackWhenHighRowIDIsReused(t *testing.T) {
+	dbPath, _, db := newTestDB(t)
+	defer db.Close()
+	seedOpenCodeEventJournal(t, db)
+	for seq := 1; seq <= 3; seq++ {
+		addOpenCodeEvent(
+			t, db, fmt.Sprintf("evt_%03d", seq), "ses_a", "message.updated.1", seq,
+		)
+	}
+	cursor, supported, err := OpenCodeEventCursor(dbPath)
+	require.NoError(t, err)
+	require.True(t, supported)
+
+	_, err = db.Exec("DELETE FROM event WHERE rowid >= 2")
+	require.NoError(t, err)
+	for seq := 2; seq <= 5; seq++ {
+		addOpenCodeEvent(
+			t, db, fmt.Sprintf("replacement_%03d", seq), "ses_a", "message.updated.1", seq,
+		)
+	}
+	delta, err := ListOpenCodeEventDelta(dbPath, cursor)
+	require.NoError(t, err)
+	assert.True(t, delta.Supported)
+	assert.False(t, delta.Complete,
+		"a reused cursor boundary must force full reconciliation")
+}
+
+func TestOpenCodeEventCursorUnsupportedSchema(t *testing.T) {
+	dbPath, _, db := newTestDB(t)
+	defer db.Close()
+
+	cursor, supported, err := OpenCodeEventCursor(dbPath)
+	require.NoError(t, err)
+	assert.False(t, supported)
+	assert.Empty(t, cursor)
 }
 
 func TestParseOpenCodeDB_StandardSession(t *testing.T) {

@@ -26,6 +26,282 @@ type OpenCodeSessionMeta struct {
 	FileMtime   int64
 }
 
+// OpenCodeEventDelta is the changed-session view exposed by OpenCode's durable
+// event journal. Supported is false for older databases and compatible forks
+// that do not provide the journal.
+type OpenCodeEventDelta struct {
+	SessionIDs []string
+	Cursor     string
+	Supported  bool
+	Complete   bool
+	RetryAfter time.Duration
+}
+
+type openCodeEventCursor struct {
+	RowID      int64                `json:"rowid"`
+	BoundaryID string               `json:"boundary_id"`
+	State      SQLiteContainerState `json:"state"`
+	Pending    map[string]int64     `json:"pending,omitempty"`
+}
+
+const openCodeEventQuietPeriod = 2 * time.Second
+
+func encodeOpenCodeEventCursor(cursor openCodeEventCursor) (string, error) {
+	raw, err := json.Marshal(cursor)
+	if err != nil {
+		return "", fmt.Errorf("encoding opencode event cursor: %w", err)
+	}
+	return string(raw), nil
+}
+
+func decodeOpenCodeEventCursor(value string) (openCodeEventCursor, error) {
+	var cursor openCodeEventCursor
+	if err := json.Unmarshal([]byte(value), &cursor); err != nil {
+		return openCodeEventCursor{}, fmt.Errorf("decoding opencode event cursor: %w", err)
+	}
+	return cursor, nil
+}
+
+// OpenCodeEventCursor returns the latest durable journal position without
+// modifying the source database. SQLite rowid is insertion ordered; the
+// container state detects replacement, VACUUM, deletion, and rowid reuse.
+func OpenCodeEventCursor(dbPath string) (string, bool, error) {
+	db, err := openOpenCodeDB(dbPath)
+	if err != nil {
+		return "", false, err
+	}
+	defer db.Close()
+
+	if !openCodeEventJournalSupported(db) {
+		return "", false, nil
+	}
+	state, ok := StatSQLiteContainerState(dbPath)
+	if !ok {
+		return "", true, fmt.Errorf("reading opencode container state")
+	}
+	var (
+		rowID      int64
+		boundaryID string
+	)
+	err = db.QueryRow(`
+		SELECT COALESCE(MAX(rowid), 0),
+		       COALESCE((SELECT id FROM event ORDER BY rowid DESC LIMIT 1), '')
+		FROM event
+	`).Scan(
+		&rowID, &boundaryID,
+	)
+	if err != nil {
+		return "", true, fmt.Errorf("reading opencode event cursor: %w", err)
+	}
+	cursor, err := encodeOpenCodeEventCursor(openCodeEventCursor{
+		RowID:      rowID,
+		BoundaryID: boundaryID,
+		State:      state,
+	})
+	return cursor, true, err
+}
+
+// ListOpenCodeEventDelta returns session IDs named by events after cursor. The
+// rowid range scan is proportional to the changed batch. Sessions remain in
+// the cursor until their event stream has been quiet long enough to coalesce
+// rapid part updates. Complete is false when the journal regressed, the
+// container changed without a new event, or the batch contains a non-session
+// aggregate; callers then fall back to full container discovery.
+func ListOpenCodeEventDelta(dbPath, cursor string) (OpenCodeEventDelta, error) {
+	return listOpenCodeEventDeltaAt(dbPath, cursor, time.Now())
+}
+
+func listOpenCodeEventDeltaAt(
+	dbPath, cursor string,
+	now time.Time,
+) (OpenCodeEventDelta, error) {
+	db, err := openOpenCodeDB(dbPath)
+	if err != nil {
+		return OpenCodeEventDelta{}, err
+	}
+	defer db.Close()
+
+	if !openCodeEventJournalSupported(db) {
+		return OpenCodeEventDelta{}, nil
+	}
+	previous, err := decodeOpenCodeEventCursor(cursor)
+	if err != nil {
+		return OpenCodeEventDelta{Supported: true}, nil
+	}
+	state, ok := StatSQLiteContainerState(dbPath)
+	if !ok {
+		return OpenCodeEventDelta{Supported: true}, nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return OpenCodeEventDelta{}, fmt.Errorf("starting opencode event read: %w", err)
+	}
+	defer tx.Rollback()
+
+	var (
+		high       int64
+		boundaryID string
+	)
+	err = tx.QueryRow(`
+		SELECT COALESCE(MAX(rowid), 0),
+		       COALESCE((SELECT id FROM event ORDER BY rowid DESC LIMIT 1), '')
+		FROM event
+	`).Scan(
+		&high, &boundaryID,
+	)
+	if err != nil {
+		return OpenCodeEventDelta{}, fmt.Errorf("reading opencode event cursor: %w", err)
+	}
+	boundaryReused := false
+	if previous.RowID > 0 && previous.BoundaryID != "" {
+		var currentBoundary string
+		err = tx.QueryRow(
+			"SELECT id FROM event WHERE rowid = ?", previous.RowID,
+		).Scan(&currentBoundary)
+		boundaryReused = err == sql.ErrNoRows ||
+			(err == nil && currentBoundary != previous.BoundaryID)
+		if err != nil && err != sql.ErrNoRows {
+			return OpenCodeEventDelta{}, fmt.Errorf("reading opencode event boundary: %w", err)
+		}
+	}
+	if high < previous.RowID ||
+		boundaryReused ||
+		(high == previous.RowID && state != previous.State) {
+		return OpenCodeEventDelta{Supported: true}, nil
+	}
+	pending := make(map[string]int64, len(previous.Pending))
+	for sessionID, changedAt := range previous.Pending {
+		pending[sessionID] = changedAt
+	}
+	ready := make(map[string]struct{})
+	complete := true
+	if high > previous.RowID {
+		rows, err := tx.Query(`
+			SELECT aggregate_id,
+			       type,
+			       COALESCE(CAST(json_extract(data, '$.time') AS INTEGER), 0),
+			       COALESCE(json_extract(data, '$.info.role'), ''),
+			       json_type(data, '$.info.time.completed') IS NOT NULL,
+			       json_type(data, '$.info.error') IS NOT NULL
+			FROM event
+			WHERE rowid > ? AND rowid <= ?
+			ORDER BY rowid
+		`, previous.RowID, high)
+		if err != nil {
+			return OpenCodeEventDelta{}, fmt.Errorf("listing opencode events: %w", err)
+		}
+		nowMS := now.UnixMilli()
+		for rows.Next() {
+			var (
+				aggregateID string
+				eventType   string
+				changedAt   int64
+				role        string
+				completed   bool
+				failed      bool
+			)
+			if err := rows.Scan(
+				&aggregateID,
+				&eventType,
+				&changedAt,
+				&role,
+				&completed,
+				&failed,
+			); err != nil {
+				rows.Close()
+				return OpenCodeEventDelta{}, fmt.Errorf("scanning opencode event: %w", err)
+			}
+			if !strings.HasPrefix(aggregateID, "ses_") {
+				complete = false
+				continue
+			}
+			if changedAt <= 0 || changedAt > nowMS {
+				changedAt = nowMS
+			}
+			if changedAt > pending[aggregateID] {
+				pending[aggregateID] = changedAt
+			}
+			if openCodeEventSettlesSession(eventType, role, completed, failed) {
+				ready[aggregateID] = struct{}{}
+				delete(pending, aggregateID)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return OpenCodeEventDelta{}, fmt.Errorf("listing opencode events: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return OpenCodeEventDelta{}, fmt.Errorf("closing opencode events: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return OpenCodeEventDelta{}, fmt.Errorf("finishing opencode event read: %w", err)
+	}
+
+	ids := make([]string, 0, len(ready)+len(pending))
+	quietBefore := now.Add(-openCodeEventQuietPeriod).UnixMilli()
+	for id, changedAt := range pending {
+		if changedAt > quietBefore {
+			continue
+		}
+		ready[id] = struct{}{}
+		delete(pending, id)
+	}
+	for id := range ready {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	nextCursor, err := encodeOpenCodeEventCursor(openCodeEventCursor{
+		RowID:      high,
+		BoundaryID: boundaryID,
+		State:      state,
+		Pending:    pending,
+	})
+	if err != nil {
+		return OpenCodeEventDelta{}, err
+	}
+	delta := OpenCodeEventDelta{
+		SessionIDs: ids,
+		Cursor:     nextCursor,
+		Supported:  true,
+		Complete:   complete,
+	}
+	for _, changedAt := range pending {
+		retryAfter := time.UnixMilli(changedAt).
+			Add(openCodeEventQuietPeriod).
+			Sub(now)
+		if retryAfter <= 0 {
+			retryAfter = time.Millisecond
+		}
+		if delta.RetryAfter == 0 || retryAfter < delta.RetryAfter {
+			delta.RetryAfter = retryAfter
+		}
+	}
+	return delta, nil
+}
+
+func openCodeEventSettlesSession(
+	eventType, role string,
+	completed, failed bool,
+) bool {
+	if strings.HasPrefix(eventType, "session.") {
+		return true
+	}
+	return eventType == "message.updated.1" &&
+		(role == "user" || completed || failed)
+}
+
+func openCodeEventJournalSupported(db *sql.DB) bool {
+	var count int
+	err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM sqlite_schema
+		WHERE type = 'table' AND name IN ('event', 'event_sequence')
+	`).Scan(&count)
+	return err == nil && count == 2
+}
+
 // OpenCodeSQLiteSessionExists reports whether a session row with
 // the given ID is present in the OpenCode SQLite database at
 // dbPath. Returns false when the file is missing, the schema is
@@ -99,6 +375,46 @@ func ListOpenCodeSessionMeta(
 		})
 	}
 	return metas, rows.Err()
+}
+
+// ListOpenCodeSessionMetaByID reads only the requested session rows. Missing
+// IDs represent durable deletion events and are intentionally omitted.
+func ListOpenCodeSessionMetaByID(
+	dbPath string,
+	sessionIDs []string,
+) ([]OpenCodeSessionMeta, error) {
+	if len(sessionIDs) == 0 {
+		return nil, nil
+	}
+	db, err := openOpenCodeDB(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	stmt, err := db.Prepare("SELECT time_updated FROM session WHERE id = ?")
+	if err != nil {
+		return nil, fmt.Errorf("preparing opencode session metadata lookup: %w", err)
+	}
+	defer stmt.Close()
+
+	metas := make([]OpenCodeSessionMeta, 0, len(sessionIDs))
+	for _, id := range sessionIDs {
+		var timeUpdated int64
+		err := stmt.QueryRow(id).Scan(&timeUpdated)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("reading opencode session metadata: %w", err)
+		}
+		metas = append(metas, OpenCodeSessionMeta{
+			SessionID:   id,
+			VirtualPath: dbPath + "#" + id,
+			FileMtime:   timeUpdated * 1_000_000,
+		})
+	}
+	return metas, nil
 }
 
 // parseOpenCodeDBSession parses a single session by ID from the

@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -29,6 +30,17 @@ import (
 func openTestDB(t *testing.T) *db.DB {
 	t.Helper()
 	return dbtest.OpenTestDB(t)
+}
+
+func TestMergeChangedPathDiscoveredFilePreservesContentChange(t *testing.T) {
+	currentSource := parser.SourceRef{Key: "session"}
+	nextSource := parser.SourceRef{Key: "session", ContentChanged: true}
+	merged := mergeChangedPathDiscoveredFile(
+		parser.DiscoveredFile{ProviderSource: &currentSource},
+		parser.DiscoveredFile{ProviderSource: &nextSource},
+	)
+	require.NotNil(t, merged.ProviderSource)
+	assert.True(t, merged.ProviderSource.ContentChanged)
 }
 
 func TestStartupMaintenanceWaitsForForegroundSyncAndSerializesLaterSyncs(
@@ -4412,6 +4424,19 @@ func seedOpenCodeSQLiteWALSession(t *testing.T, dbPath, sessionID string) {
 			data TEXT NOT NULL,
 			time_created INTEGER NOT NULL
 		);
+		CREATE TABLE event_sequence (
+			aggregate_id TEXT PRIMARY KEY,
+			seq INTEGER NOT NULL
+		);
+		CREATE TABLE event (
+			id TEXT PRIMARY KEY,
+			aggregate_id TEXT NOT NULL,
+			seq INTEGER NOT NULL,
+			type TEXT NOT NULL,
+			data TEXT NOT NULL
+		);
+		CREATE UNIQUE INDEX event_aggregate_seq_idx
+			ON event (aggregate_id, seq);
 	`)
 	require.NoError(t, err, "create opencode schema")
 	var journalMode string
@@ -4429,6 +4454,287 @@ func seedOpenCodeSQLiteWALSession(t *testing.T, dbPath, sessionID string) {
 		sessionID,
 	)
 	require.NoError(t, err, "insert session")
+	_, err = d.Exec(`
+		INSERT INTO message (id, session_id, data, time_created)
+		VALUES ('msg_1', ?, '{"role":"user"}', 1);
+		INSERT INTO part (id, session_id, message_id, data, time_created)
+		VALUES ('part_1', ?, 'msg_1', '{"type":"text","text":"hello"}', 1);
+	`, sessionID, sessionID)
+	require.NoError(t, err, "insert transcript")
+	_, err = d.Exec(`
+		INSERT INTO event_sequence (aggregate_id, seq) VALUES (?, 1);
+		INSERT INTO event (id, aggregate_id, seq, type, data)
+		VALUES ('evt_001', ?, 1, 'session.created.1', '{"time":1}');
+	`, sessionID, sessionID)
+	require.NoError(t, err, "insert initial event")
+}
+
+func addOpenCodeSQLiteTestEvent(
+	t *testing.T, dbPath, id, sessionID, eventType string, seq int,
+) {
+	t.Helper()
+	addOpenCodeSQLiteTestEventData(
+		t, dbPath, id, sessionID, eventType, `{"time":1}`, seq,
+	)
+}
+
+func addOpenCodeSQLiteTestEventData(
+	t *testing.T,
+	dbPath, id, sessionID, eventType, data string,
+	seq int,
+) {
+	t.Helper()
+	d, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	defer d.Close()
+	_, err = d.Exec(`
+		INSERT INTO event (id, aggregate_id, seq, type, data)
+		VALUES (?, ?, ?, ?, ?);
+		UPDATE event_sequence SET seq = ? WHERE aggregate_id = ?;
+	`, id, sessionID, seq, eventType, data, seq, sessionID)
+	require.NoError(t, err, "insert changed event")
+}
+
+func TestEngineSyncPathsAcknowledgesOpenCodeEventCursor(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "opencode.db")
+	seedOpenCodeSQLiteWALSession(t, dbPath, "ses_cursor")
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentOpenCode: {root},
+		},
+		Machine: "local",
+	})
+	defer engine.Close()
+
+	stats := engine.SyncAll(context.Background(), nil)
+	require.Zero(t, stats.Failed)
+	initialCursor := engine.changedPathCursors[dbPath]
+	require.NotEmpty(t, initialCursor)
+
+	addOpenCodeSQLiteTestEvent(
+		t, dbPath, "evt_002", "ses_cursor", "message.part.updated.1", 2,
+	)
+	engine.SyncPaths([]string{dbPath})
+	assert.NotEqual(t, initialCursor, engine.changedPathCursors[dbPath])
+}
+
+func TestEngineSyncAllSinceDoesNotAdvanceOpenCodeEventCursor(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "opencode.db")
+	seedOpenCodeSQLiteWALSession(t, dbPath, "ses_quick")
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentOpenCode: {root},
+		},
+		Machine: "local",
+	})
+	defer engine.Close()
+
+	stats := engine.SyncAll(context.Background(), nil)
+	require.Zero(t, stats.Failed)
+	initialCursor := engine.changedPathCursors[dbPath]
+	require.NotEmpty(t, initialCursor)
+	addOpenCodeSQLiteTestEvent(
+		t, dbPath, "evt_002", "ses_quick", "message.updated.1", 2,
+	)
+
+	stats = engine.SyncAllSince(
+		context.Background(), time.Now().Add(time.Hour), nil,
+	)
+	require.Zero(t, stats.Failed)
+	assert.Equal(t, initialCursor, engine.changedPathCursors[dbPath],
+		"a cutoff-filtered discovery pass cannot acknowledge journal events")
+}
+
+func TestEngineSyncPathsCoalescesOpenCodePartEventsUntilCompletion(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "opencode.db")
+	seedOpenCodeSQLiteWALSession(t, dbPath, "ses_stream")
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentOpenCode: {root},
+		},
+		Machine: "local",
+	})
+	defer engine.Close()
+
+	stats := engine.SyncAll(context.Background(), nil)
+	require.Zero(t, stats.Failed)
+	initialCursor := engine.changedPathCursors[dbPath]
+	require.NotEmpty(t, initialCursor)
+
+	d, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = d.Exec(`
+		UPDATE part
+		SET data = '{"type":"text","text":"streamed reply"}'
+		WHERE id = 'part_1'
+	`)
+	require.NoError(t, err)
+	require.NoError(t, d.Close())
+
+	for seq := 2; seq <= 20; seq++ {
+		addOpenCodeSQLiteTestEventData(
+			t,
+			dbPath,
+			fmt.Sprintf("evt_%03d", seq),
+			"ses_stream",
+			"message.part.updated.1",
+			fmt.Sprintf(`{"time":%d}`, time.Now().UnixMilli()),
+			seq,
+		)
+		engine.SyncPaths([]string{dbPath})
+	}
+	assert.NotEqual(t, initialCursor, engine.changedPathCursors[dbPath])
+	stored, err := database.GetMessages(
+		context.Background(), "opencode:ses_stream", 0, 10, true,
+	)
+	require.NoError(t, err)
+	require.Len(t, stored, 1)
+	assert.Equal(t, "hello", stored[0].Content)
+
+	addOpenCodeSQLiteTestEventData(
+		t,
+		dbPath,
+		"evt_021",
+		"ses_stream",
+		"message.updated.1",
+		`{"info":{"role":"assistant","time":{"completed":1}}}`,
+		21,
+	)
+	engine.SyncPaths([]string{dbPath})
+	stored, err = database.GetMessages(
+		context.Background(), "opencode:ses_stream", 0, 10, true,
+	)
+	require.NoError(t, err)
+	require.Len(t, stored, 1)
+	assert.Equal(t, "streamed reply", stored[0].Content)
+}
+
+func TestEngineSyncPathsRetriesQuietOpenCodePartEvents(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "opencode.db")
+	seedOpenCodeSQLiteWALSession(t, dbPath, "ses_retry")
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentOpenCode: {root},
+		},
+		Machine: "local",
+	})
+	defer engine.Close()
+
+	stats := engine.SyncAll(context.Background(), nil)
+	require.Zero(t, stats.Failed)
+	d, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = d.Exec(`
+		UPDATE part
+		SET data = '{"type":"text","text":"quiet reply"}'
+		WHERE id = 'part_1'
+	`)
+	require.NoError(t, err)
+	require.NoError(t, d.Close())
+
+	changedAt := time.Now().Add(-(2*time.Second - 100*time.Millisecond)).UnixMilli()
+	addOpenCodeSQLiteTestEventData(
+		t,
+		dbPath,
+		"evt_002",
+		"ses_retry",
+		"message.part.updated.1",
+		fmt.Sprintf(`{"time":%d}`, changedAt),
+		2,
+	)
+	engine.SyncPaths([]string{dbPath})
+	stored, err := database.GetMessages(
+		context.Background(), "opencode:ses_retry", 0, 10, true,
+	)
+	require.NoError(t, err)
+	require.Len(t, stored, 1)
+	assert.Equal(t, "hello", stored[0].Content)
+
+	require.Eventually(t, func() bool {
+		messages, getErr := database.GetMessages(
+			context.Background(), "opencode:ses_retry", 0, 10, true,
+		)
+		return getErr == nil && len(messages) == 1 &&
+			messages[0].Content == "quiet reply"
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestEngineSyncPathsRetainsOpenCodeEventCursorOnParseFailure(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "opencode.db")
+	seedOpenCodeSQLiteWALSession(t, dbPath, "ses_cursor")
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentOpenCode: {root},
+		},
+		Machine: "local",
+	})
+	defer engine.Close()
+
+	stats := engine.SyncAll(context.Background(), nil)
+	require.Zero(t, stats.Failed)
+	initialCursor := engine.changedPathCursors[dbPath]
+	require.NotEmpty(t, initialCursor)
+
+	d, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = d.Exec("DROP TABLE project")
+	require.NoError(t, err)
+	require.NoError(t, d.Close())
+	addOpenCodeSQLiteTestEvent(
+		t, dbPath, "evt_002", "ses_cursor", "message.updated.1", 2,
+	)
+
+	engine.SyncPaths([]string{dbPath})
+	assert.Equal(t, initialCursor, engine.changedPathCursors[dbPath])
+}
+
+func TestEngineSyncPathsPreservesArchivedOpenCodeSessionAfterJournalDeletion(
+	t *testing.T,
+) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "opencode.db")
+	seedOpenCodeSQLiteWALSession(t, dbPath, "ses_deleted")
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentOpenCode: {root},
+		},
+		Machine: "local",
+	})
+	defer engine.Close()
+
+	stats := engine.SyncAll(context.Background(), nil)
+	require.Zero(t, stats.Failed)
+	initialCursor := engine.changedPathCursors[dbPath]
+	require.NotEmpty(t, initialCursor)
+
+	d, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = d.Exec(`
+		DELETE FROM event WHERE aggregate_id = 'ses_deleted';
+		DELETE FROM event_sequence WHERE aggregate_id = 'ses_deleted';
+		DELETE FROM session WHERE id = 'ses_deleted';
+	`)
+	require.NoError(t, err)
+	require.NoError(t, d.Close())
+
+	engine.SyncPaths([]string{dbPath})
+	session, err := database.GetSessionFull(
+		context.Background(), "opencode:ses_deleted",
+	)
+	require.NoError(t, err)
+	require.NotNil(t, session, "source deletion must not delete the persistent archive")
+	assert.NotEqual(t, initialCursor, engine.changedPathCursors[dbPath])
 }
 
 func TestEngine_ClassifyPathsOpenCodeRemovedMessageFile(

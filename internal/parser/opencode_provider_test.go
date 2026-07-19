@@ -3,6 +3,7 @@ package parser
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -189,6 +190,101 @@ func TestOpenCodeProviderSQLiteSourceMethods(t *testing.T) {
 	)
 	require.NoError(t, err)
 	assert.Empty(t, removed, "removed sqlite DBs have no stateless virtual source list")
+}
+
+func TestOpenCodeProviderSQLiteEventDeltaIsBoundedByChangedSessions(t *testing.T) {
+	for _, sessionCount := range []int{10, 5000} {
+		t.Run(fmt.Sprintf("sessions_%d", sessionCount), func(t *testing.T) {
+			root := t.TempDir()
+			dbPath, _, db := newTestDBAt(t, filepath.Join(root, "opencode.db"))
+			defer db.Close()
+			seedOpenCodeEventJournal(t, db)
+			_, err := db.Exec(
+				"INSERT INTO project (id, worktree) VALUES (?, ?)",
+				"prj_scale", "/tmp/scale",
+			)
+			require.NoError(t, err)
+			tx, err := db.Begin()
+			require.NoError(t, err)
+			stmt, err := tx.Prepare(`
+				INSERT INTO session
+					(id, project_id, time_created, time_updated)
+				VALUES (?, 'prj_scale', 1, 2)
+			`)
+			require.NoError(t, err)
+			for i := range sessionCount {
+				_, err = stmt.Exec(fmt.Sprintf("ses_%06d", i))
+				require.NoError(t, err)
+			}
+			require.NoError(t, stmt.Close())
+			require.NoError(t, tx.Commit())
+
+			target := fmt.Sprintf("ses_%06d", sessionCount/2)
+			addOpenCodeEvent(t, db, "evt_001", target, "session.created.1", 1)
+			cursor, supported, err := OpenCodeEventCursor(dbPath)
+			require.NoError(t, err)
+			require.True(t, supported)
+			addOpenCodeEvent(t, db, "evt_002", target, "message.part.updated.1", 2)
+
+			provider, ok := NewProvider(AgentOpenCode, ProviderConfig{Roots: []string{root}})
+			require.True(t, ok)
+			cursorProvider, ok := provider.(ChangedPathCursorProvider)
+			require.True(t, ok)
+			result, err := cursorProvider.SourcesForChangedPathCursor(
+				context.Background(),
+				ChangedPathRequest{
+					Path:          dbPath,
+					EventKind:     "write",
+					WatchRoot:     root,
+					ChangeCursors: map[string]string{dbPath: cursor},
+				},
+			)
+			require.NoError(t, err)
+			require.Len(t, result.Sources, 1)
+			assert.Equal(t, dbPath+"#"+target, result.Sources[0].DisplayPath)
+			require.Len(t, result.Cursors, 1)
+			decoded, err := decodeOpenCodeEventCursor(result.Cursors[0].Value)
+			require.NoError(t, err)
+			assert.Equal(t, int64(2), decoded.RowID)
+		})
+	}
+}
+
+func TestOpenCodeProviderSQLiteEventDeltaDoesNotEnumerateHybridSessions(t *testing.T) {
+	root := t.TempDir()
+	dbPath, seeder, db := newTestDBAt(t, filepath.Join(root, "opencode.db"))
+	defer db.Close()
+	seedOpenCodeEventJournal(t, db)
+	seeder.AddProject("prj_hybrid", "/tmp/hybrid")
+	seeder.AddSession("ses_changed", "prj_hybrid", "", "Changed", 1, 2)
+	addOpenCodeEvent(t, db, "evt_001", "ses_changed", "session.created.1", 1)
+	cursor, supported, err := OpenCodeEventCursor(dbPath)
+	require.NoError(t, err)
+	require.True(t, supported)
+
+	storageProject := filepath.Join(root, "storage", "session", "project")
+	require.NoError(t, os.MkdirAll(storageProject, 0o755))
+	for i := range 5000 {
+		path := filepath.Join(storageProject, fmt.Sprintf("ses_stable_%06d.json", i))
+		require.NoError(t, os.WriteFile(path, []byte("{}"), 0o600))
+	}
+	addOpenCodeEvent(t, db, "evt_002", "ses_changed", "message.part.updated.1", 2)
+
+	provider, ok := NewProvider(AgentOpenCode, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	cursorProvider := provider.(ChangedPathCursorProvider)
+	result, err := cursorProvider.SourcesForChangedPathCursor(
+		context.Background(),
+		ChangedPathRequest{
+			Path:          dbPath,
+			EventKind:     "write",
+			WatchRoot:     root,
+			ChangeCursors: map[string]string{dbPath: cursor},
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, result.Sources, 1)
+	assert.Equal(t, dbPath+"#ses_changed", result.Sources[0].DisplayPath)
 }
 
 func TestOpenCodeProviderIgnoresNonDataSQLiteSidecars(t *testing.T) {
