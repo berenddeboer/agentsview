@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -137,7 +138,7 @@ func listOpenCodeEventDeltaAt(
 	if err != nil {
 		return OpenCodeEventDelta{}, fmt.Errorf("starting opencode event read: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	var (
 		high       int64
@@ -171,9 +172,7 @@ func listOpenCodeEventDeltaAt(
 		return OpenCodeEventDelta{Supported: true}, nil
 	}
 	pending := make(map[string]int64, len(previous.Pending))
-	for sessionID, changedAt := range previous.Pending {
-		pending[sessionID] = changedAt
-	}
+	maps.Copy(pending, previous.Pending)
 	ready := make(map[string]struct{})
 	complete := true
 	if high > previous.RowID {

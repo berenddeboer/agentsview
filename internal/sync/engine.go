@@ -949,9 +949,7 @@ func (e *Engine) captureChangedPathCursors(
 }
 
 func (e *Engine) promoteChangedPathCursors(cursors map[string]string) {
-	for key, cursor := range cursors {
-		e.changedPathCursors[key] = cursor
-	}
+	maps.Copy(e.changedPathCursors, cursors)
 }
 
 func (e *Engine) updateChangedPathRetries(retries []parser.ChangedPathRetry) {
