@@ -2175,6 +2175,18 @@ func (db *DB) ListStoredSourcePathHints(
 	agent string,
 	roots []string,
 ) ([]string, error) {
+	return db.ListStoredSourcePathHintsContext(
+		context.Background(), agent, roots,
+	)
+}
+
+// ListStoredSourcePathHintsContext is the cancellable form of
+// ListStoredSourcePathHints for watcher-driven scans.
+func (db *DB) ListStoredSourcePathHintsContext(
+	ctx context.Context,
+	agent string,
+	roots []string,
+) ([]string, error) {
 	if agent == "" {
 		return nil, nil
 	}
@@ -2186,10 +2198,13 @@ func (db *DB) ListStoredSourcePathHints(
 	seen := make(map[string]struct{})
 	var hints []string
 	for start := 0; start < len(roots); start += storedSourcePathHintRootBatchSize {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		end := min(start+storedSourcePathHintRootBatchSize, len(roots))
 		batch := roots[start:end]
 		query, args := storedSourcePathHintQuery(agent, batch)
-		rows, err := db.getReader().Query(query, args...)
+		rows, err := db.getReader().QueryContext(ctx, query, args...)
 		if err != nil {
 			return nil, fmt.Errorf("listing stored source path hints: %w", err)
 		}

@@ -141,6 +141,8 @@ type Engine struct {
 	changedPathRetryTimers  map[string]*time.Timer
 	changedPathRetryWG      gosync.WaitGroup
 	changedPathRetryClosed  bool
+	changedPathRetryCtx     context.Context
+	changedPathRetryCancel  context.CancelFunc
 	projectIdentityMu       gosync.Mutex
 	projectIdentityCache    map[string]projectIdentityCacheEntry
 	projectIdentityWritten  map[string]struct{}
@@ -283,6 +285,7 @@ func NewEngine(
 		maps.Copy(providerModes, cfg.ProviderMigrationModes)
 	}
 
+	retryCtx, retryCancel := context.WithCancel(context.Background())
 	e := &Engine{
 		db:                      database,
 		agentDirs:               dirs,
@@ -301,6 +304,8 @@ func NewEngine(
 		providerMigrationModes:  providerModes,
 		changedPathCursors:      make(map[string]string),
 		changedPathRetryTimers:  make(map[string]*time.Timer),
+		changedPathRetryCtx:     retryCtx,
+		changedPathRetryCancel:  retryCancel,
 		projectIdentityCache:    make(map[string]projectIdentityCacheEntry),
 		projectIdentityWritten:  make(map[string]struct{}),
 		startupMaintenanceReady: make(chan struct{}),
@@ -339,6 +344,9 @@ func NewEngine(
 // the scheduler. Call once when the engine's owner shuts down;
 // safe to call repeatedly.
 func (e *Engine) Close() {
+	if e.changedPathRetryCancel != nil {
+		e.changedPathRetryCancel()
+	}
 	e.stopChangedPathRetries()
 	e.signalSched.stop()
 }
@@ -599,6 +607,25 @@ func (e *Engine) SyncPaths(paths []string) {
 	e.SyncPathsContext(context.Background(), paths)
 }
 
+func lockMutexContext(ctx context.Context, mu *gosync.Mutex) bool {
+	const retryInterval = 5 * time.Millisecond
+	ticker := time.NewTicker(retryInterval)
+	defer ticker.Stop()
+	for {
+		if ctx.Err() != nil {
+			return false
+		}
+		if mu.TryLock() {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+		}
+	}
+}
+
 // SyncPathsContext is SyncPaths with caller-controlled cancellation. The
 // file watcher threads the serve shutdown context through here: its stop
 // path waits for the in-flight onChange callback, so a watcher-driven sync
@@ -608,13 +635,15 @@ func (e *Engine) SyncPathsContext(ctx context.Context, paths []string) {
 	if e.refuseWriteInForceParse("SyncPaths") {
 		return
 	}
+	if !lockMutexContext(ctx, &e.syncMu) {
+		return
+	}
 	var stats SyncStats
 	defer func() {
 		if stats.Synced > 0 {
 			e.emit("sessions")
 		}
 	}()
-	e.syncMu.Lock()
 	defer e.syncMu.Unlock()
 	defer e.clearCurrentProgress()
 
@@ -623,7 +652,7 @@ func (e *Engine) SyncPathsContext(ctx context.Context, paths []string) {
 	preContainerStates := e.captureSQLiteContainerStates(paths)
 	e.pendingChangedCursors = make(map[string]string)
 	e.pendingChangedRetries = make([]parser.ChangedPathRetry, 0)
-	files := e.classifyPaths(paths)
+	files := e.classifyPathsContext(ctx, paths)
 	cursorUpdates := e.pendingChangedCursors
 	retryUpdates := e.pendingChangedRetries
 	e.pendingChangedCursors = nil
@@ -678,9 +707,19 @@ func (e *Engine) SyncPathsContext(ctx context.Context, paths []string) {
 func (e *Engine) classifyPaths(
 	paths []string,
 ) []parser.DiscoveredFile {
+	return e.classifyPathsContext(context.Background(), paths)
+}
+
+func (e *Engine) classifyPathsContext(
+	ctx context.Context,
+	paths []string,
+) []parser.DiscoveredFile {
 	seen := make(map[string]int, len(paths))
 	files := make([]parser.DiscoveredFile, 0, len(paths))
 	for _, p := range paths {
+		if ctx.Err() != nil {
+			break
+		}
 		// Codex resolved-index events map to potentially several session
 		// sources and must classify even when the event path was deleted, so
 		// they are handled by classifyCodexIndexPath. All other changed paths,
@@ -688,7 +727,7 @@ func (e *Engine) classifyPaths(
 		// history.jsonl), are owned by each provider-authoritative
 		// SourcesForChangedPath via classifyProviderChangedPath.
 		dfs := e.classifyCodexIndexPath(p)
-		dfs = append(dfs, e.classifyProviderChangedPath(p)...)
+		dfs = append(dfs, e.classifyProviderChangedPathContext(ctx, p)...)
 		for _, df := range dfs {
 			e.invalidateVerifiedDiscoveredSource(df)
 			key := string(df.Agent) + "\x00" + df.Path
@@ -729,7 +768,13 @@ func mergeChangedPathDiscoveredFile(
 func (e *Engine) classifyProviderChangedPath(
 	path string,
 ) []parser.DiscoveredFile {
-	ctx := context.Background()
+	return e.classifyProviderChangedPathContext(context.Background(), path)
+}
+
+func (e *Engine) classifyProviderChangedPathContext(
+	ctx context.Context,
+	path string,
+) []parser.DiscoveredFile {
 	eventKind := providerChangedPathEventKind(path)
 	var files []parser.DiscoveredFile
 	seen := map[string]struct{}{}
@@ -743,6 +788,9 @@ func (e *Engine) classifyProviderChangedPath(
 	})
 
 	for _, agentType := range agents {
+		if ctx.Err() != nil {
+			return files
+		}
 		mode := e.providerMigrationModes[agentType]
 		switch mode {
 		case parser.ProviderMigrationProviderAuthoritative:
@@ -786,16 +834,23 @@ func (e *Engine) classifyProviderChangedPath(
 			continue
 		}
 		for _, watchRoot := range watchRoots {
+			if ctx.Err() != nil {
+				return files
+			}
 			var storedSourcePaths []string
 			if provider.Capabilities().Source.StoredSourceHints == parser.CapabilitySupported {
 				var err error
-				storedSourcePaths, err = e.db.ListStoredSourcePathHints(
+				storedSourcePaths, err = e.db.ListStoredSourcePathHintsContext(
+					ctx,
 					string(def.Type),
 					providerChangedPathStoredHintRoots(
 						agentType, watchRoot, path,
 					),
 				)
 				if err != nil {
+					if ctx.Err() != nil {
+						return files
+					}
 					log.Printf(
 						"%s provider changed-path stored hints: %v",
 						def.Type, err,
@@ -825,6 +880,9 @@ func (e *Engine) classifyProviderChangedPath(
 				sources, err = provider.SourcesForChangedPath(ctx, req)
 			}
 			if err != nil {
+				if ctx.Err() != nil {
+					return files
+				}
 				if !errors.Is(err, parser.ErrUnsupportedProviderFeature) {
 					log.Printf(
 						"%s provider changed-path classification: %v",
@@ -989,7 +1047,7 @@ func (e *Engine) updateChangedPathRetries(retries []parser.ChangedPathRetry) {
 			closed := e.changedPathRetryClosed
 			e.changedPathRetryMu.Unlock()
 			if !closed {
-				e.SyncPaths([]string{key})
+				e.SyncPathsContext(e.changedPathRetryCtx, []string{key})
 			}
 			e.changedPathRetryWG.Done()
 		})
@@ -1658,8 +1716,10 @@ func (e *Engine) resyncAllWithOptionsLocked(
 		"Discovering sessions",
 		"",
 	)
-	stats = e.syncAllLocked(
+	var stagedChangeCursors map[string]string
+	stats = e.syncAllLockedStagingChangeCursors(
 		ctx, reportResyncProgress, time.Time{}, nil, syncWriteBulk, true, false,
+		&stagedChangeCursors,
 	)
 	e.db = origDB // restore immediately
 	e.openCodeArchiveStore = nil
@@ -2099,6 +2159,9 @@ func (e *Engine) resyncAllWithOptionsLocked(
 				log.Printf("resync: wal checkpoint: %v", err)
 			}
 		}
+	}
+	if stagedChangeCursors != nil {
+		e.changedPathCursors = stagedChangeCursors
 	}
 
 	// 6. Persist skip cache into the new DB.
@@ -2620,6 +2683,18 @@ func (e *Engine) syncAllLocked(
 	scope *rootSyncScope, writeMode syncWriteMode, recordSyncState bool,
 	forceDiscoveredFiles bool,
 ) (stats SyncStats) {
+	return e.syncAllLockedStagingChangeCursors(
+		ctx, onProgress, since, scope, writeMode, recordSyncState,
+		forceDiscoveredFiles, nil,
+	)
+}
+
+func (e *Engine) syncAllLockedStagingChangeCursors(
+	ctx context.Context, onProgress ProgressFunc, since time.Time,
+	scope *rootSyncScope, writeMode syncWriteMode, recordSyncState bool,
+	forceDiscoveredFiles bool,
+	stagedChangeCursors *map[string]string,
+) (stats SyncStats) {
 	if ctx.Err() != nil {
 		return SyncStats{Aborted: true}
 	}
@@ -2914,7 +2989,11 @@ func (e *Engine) syncAllLocked(
 		e.recordSyncFinished()
 	}
 	if scope == nil && changeCursorsOK && providerFailures == 0 && stats.Failed == 0 {
-		e.changedPathCursors = fullChangeCursors
+		if stagedChangeCursors != nil {
+			*stagedChangeCursors = fullChangeCursors
+		} else {
+			e.changedPathCursors = fullChangeCursors
+		}
 	}
 	// Emission happens in SyncAll / SyncAllSince after syncMu is
 	// released; syncAllLocked runs under the caller's lock.

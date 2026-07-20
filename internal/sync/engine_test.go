@@ -4520,6 +4520,147 @@ func TestEngineSyncPathsAcknowledgesOpenCodeEventCursor(t *testing.T) {
 	assert.NotEqual(t, initialCursor, engine.changedPathCursors[dbPath])
 }
 
+func TestEngineCloseCancelsChangedPathRetryClassification(t *testing.T) {
+	root := t.TempDir()
+	provider := &shutdownBlockingChangedPathProvider{
+		ProviderBase: parser.ProviderBase{
+			Def: parser.AgentDef{
+				Type: parser.AgentCowork, IDPrefix: "cowork:", FileBased: true,
+			},
+			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+				ClassifyChangedPath: parser.CapabilitySupported,
+			}},
+		},
+		root:     root,
+		started:  make(chan struct{}),
+		canceled: make(chan struct{}),
+	}
+	engine := NewEngine(openTestDB(t), EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCowork: {root},
+		},
+		ProviderFactories: []parser.ProviderFactory{
+			shutdownBlockingChangedPathFactory{provider: provider},
+		},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			parser.AgentCowork: parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	engine.updateChangedPathRetries([]parser.ChangedPathRetry{{
+		Key: filepath.Join(root, "changed.db"), After: time.Millisecond, Pending: true,
+	}})
+
+	require.Eventually(t, func() bool {
+		select {
+		case <-provider.started:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, time.Millisecond)
+	closed := make(chan struct{})
+	go func() {
+		engine.Close()
+		close(closed)
+	}()
+	require.Eventually(t, func() bool {
+		select {
+		case <-closed:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, time.Millisecond)
+	select {
+	case <-provider.canceled:
+	default:
+		t.Fatal("changed-path provider did not observe engine shutdown")
+	}
+}
+
+func TestEngineStopsChangedPathRetryWaitingForSyncLock(t *testing.T) {
+	engine := NewEngine(openTestDB(t), EngineConfig{})
+	engine.syncMu.Lock()
+	key := filepath.Join(t.TempDir(), "changed.db")
+	engine.updateChangedPathRetries([]parser.ChangedPathRetry{{
+		Key: key, After: time.Millisecond, Pending: true,
+	}})
+	require.Eventually(t, func() bool {
+		engine.changedPathRetryMu.Lock()
+		defer engine.changedPathRetryMu.Unlock()
+		_, pending := engine.changedPathRetryTimers[key]
+		return !pending
+	}, time.Second, time.Millisecond)
+
+	closed := make(chan struct{})
+	engine.changedPathRetryCancel()
+	go func() {
+		engine.stopChangedPathRetries()
+		close(closed)
+	}()
+	require.Eventually(t, func() bool {
+		select {
+		case <-closed:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, time.Millisecond,
+		"shutdown must cancel a retry waiting for another sync")
+	engine.syncMu.Unlock()
+	engine.Close()
+}
+
+type shutdownBlockingChangedPathFactory struct {
+	provider *shutdownBlockingChangedPathProvider
+}
+
+func (f shutdownBlockingChangedPathFactory) Definition() parser.AgentDef {
+	return f.provider.Definition()
+}
+
+func (f shutdownBlockingChangedPathFactory) Capabilities() parser.Capabilities {
+	return f.provider.Capabilities()
+}
+
+func (f shutdownBlockingChangedPathFactory) NewProvider(
+	parser.ProviderConfig,
+) parser.Provider {
+	return f.provider
+}
+
+type shutdownBlockingChangedPathProvider struct {
+	parser.ProviderBase
+	root        string
+	started     chan struct{}
+	canceled    chan struct{}
+	startedOnce gosync.Once
+	cancelOnce  gosync.Once
+}
+
+func (p *shutdownBlockingChangedPathProvider) WatchPlan(
+	context.Context,
+) (parser.WatchPlan, error) {
+	return parser.WatchPlan{Roots: []parser.WatchRoot{{Path: p.root}}}, nil
+}
+
+func (p *shutdownBlockingChangedPathProvider) SourcesForChangedPath(
+	ctx context.Context,
+	_ parser.ChangedPathRequest,
+) ([]parser.SourceRef, error) {
+	p.startedOnce.Do(func() { close(p.started) })
+	<-ctx.Done()
+	p.cancelOnce.Do(func() { close(p.canceled) })
+	return nil, ctx.Err()
+}
+
+func (p *shutdownBlockingChangedPathProvider) Parse(
+	context.Context,
+	parser.ParseRequest,
+) (parser.ParseOutcome, error) {
+	return parser.ParseOutcome{}, nil
+}
+
 func TestEngineSyncAllSinceDoesNotAdvanceOpenCodeEventCursor(t *testing.T) {
 	database := openTestDB(t)
 	root := t.TempDir()

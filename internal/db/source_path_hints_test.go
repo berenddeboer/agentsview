@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,17 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestListStoredSourcePathHintsContextHonorsCancellation(t *testing.T) {
+	d := testDB(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := d.ListStoredSourcePathHintsContext(
+		ctx, "claude", []string{t.TempDir()},
+	)
+	require.ErrorIs(t, err, context.Canceled)
+}
 
 func TestListStoredSourcePathHintsScopesByAgentAndRoot(t *testing.T) {
 

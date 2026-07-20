@@ -319,6 +319,47 @@ func TestResyncContributorFTSFailureAbortsAndCleansTempDB(t *testing.T) {
 	assert.NoFileExists(t, database.Path()+resyncTempSuffix+"-shm")
 }
 
+func TestResyncPromotesChangedPathCursorsOnlyAfterSuccessfulSwap(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "opencode.db")
+	seedOpenCodeSQLiteWALSession(t, dbPath, "ses_resync_cursor")
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentOpenCode: {root},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+
+	stats := engine.SyncAll(context.Background(), nil)
+	require.Zero(t, stats.Failed)
+	initialCursor := engine.changedPathCursors[dbPath]
+	require.NotEmpty(t, initialCursor)
+	addOpenCodeSQLiteTestEvent(
+		t, dbPath, "evt_002", "ses_resync_cursor", "message.updated.1", 2,
+	)
+
+	sentinel := errors.New("fts cursor sentinel")
+	stats, err := engine.resyncAllWithOptionsAndOperations(
+		context.Background(), nil, RebuildOptions{}, rebuildOperations{
+			rebuildFTS: func(*db.DB) error { return sentinel },
+		},
+	)
+	require.ErrorIs(t, err, sentinel)
+	require.True(t, stats.Aborted)
+	assert.Equal(t, initialCursor, engine.changedPathCursors[dbPath],
+		"a discarded temporary archive must not acknowledge source changes")
+
+	stats, err = engine.ResyncAllWithOptions(
+		context.Background(), nil, RebuildOptions{},
+	)
+	require.NoError(t, err)
+	require.False(t, stats.Aborted)
+	assert.NotEqual(t, initialCursor, engine.changedPathCursors[dbPath],
+		"a successful swap must publish its staged source cursor")
+}
+
 type blockingRebuildProvider struct {
 	parser.ProviderBase
 	started chan struct{}
