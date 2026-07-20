@@ -341,9 +341,10 @@ func TestListOpenCodeEventDeltaFallsBackWhenDatabaseIsReplacedAndAdvances(
 
 	current, ok := StatSQLiteContainerState(dbPath)
 	require.True(t, ok)
-	if previous.State.DBInode == 0 || current.DBInode == 0 {
-		t.Skip("filesystem does not expose stable file identity")
-	}
+	require.NotZero(t, previous.State.DBInode,
+		"supported platforms must expose SQLite file identity")
+	require.NotZero(t, current.DBInode,
+		"supported platforms must expose replacement file identity")
 	require.True(t,
 		previous.State.DBInode != current.DBInode ||
 			previous.State.DBDevice != current.DBDevice,

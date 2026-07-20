@@ -469,6 +469,12 @@ func (s openCodeFormatSourceSet) SourcesForChangedPathCursor(
 	result := ChangedPathCursorResult{
 		Sources: sources,
 		Cursors: fallbackCursors,
+		Retries: make([]ChangedPathRetry, 0, len(fallbackCursors)),
+	}
+	for _, cursor := range fallbackCursors {
+		result.Retries = append(result.Retries, ChangedPathRetry{
+			Key: cursor.Key,
+		})
 	}
 	if err != nil {
 		return result, err

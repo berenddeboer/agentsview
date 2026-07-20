@@ -13,3 +13,7 @@ func sourceFileIdentity(info os.FileInfo) (inode, device uint64) {
 	}
 	return 0, 0
 }
+
+func sourcePathIdentity(_ string, info os.FileInfo) (inode, device uint64) {
+	return sourceFileIdentity(info)
+}

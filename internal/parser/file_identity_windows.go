@@ -2,8 +2,32 @@
 
 package parser
 
-import "os"
+import (
+	"os"
+
+	"golang.org/x/sys/windows"
+)
 
 func sourceFileIdentity(info os.FileInfo) (inode, device uint64) {
 	return 0, 0
+}
+
+func sourcePathIdentity(path string, _ os.FileInfo) (inode, device uint64) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, 0
+	}
+	defer file.Close()
+
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(
+		windows.Handle(file.Fd()), &info,
+	); err != nil {
+		return 0, 0
+	}
+	inode = uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow)
+	if inode == 0 {
+		return 0, 0
+	}
+	return inode, uint64(info.VolumeSerialNumber)
 }

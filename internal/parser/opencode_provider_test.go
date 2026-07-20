@@ -250,6 +250,36 @@ func TestOpenCodeProviderSQLiteEventDeltaIsBoundedByChangedSessions(t *testing.T
 	}
 }
 
+func TestOpenCodeProviderSQLiteFallbackIncludesRetryDescriptor(t *testing.T) {
+	root := t.TempDir()
+	dbPath, seeder, db := newTestDBAt(t, filepath.Join(root, "opencode.db"))
+	defer db.Close()
+	seedOpenCodeEventJournal(t, db)
+	seeder.AddProject("prj_fallback", "/tmp/fallback")
+	seeder.AddSession("ses_fallback", "prj_fallback", "", "Fallback", 1, 2)
+	addOpenCodeEvent(
+		t, db, "evt_001", "ses_fallback", "session.created.1", 1,
+	)
+
+	provider, ok := NewProvider(AgentOpenCode, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	cursorProvider, ok := provider.(ChangedPathCursorProvider)
+	require.True(t, ok)
+	result, err := cursorProvider.SourcesForChangedPathCursor(
+		context.Background(),
+		ChangedPathRequest{
+			Path:      dbPath,
+			EventKind: "write",
+			WatchRoot: root,
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, result.Sources, 1)
+	require.Equal(t, []ChangedPathRetry{{Key: dbPath}}, result.Retries)
+	require.Len(t, result.Cursors, 1)
+	assert.Equal(t, dbPath, result.Cursors[0].Key)
+}
+
 func TestOpenCodeProviderSQLiteEventDeltaDoesNotListStorageProjects(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("directory read permissions are not enforced on Windows")
