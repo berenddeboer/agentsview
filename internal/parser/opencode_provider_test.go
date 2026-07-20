@@ -250,41 +250,60 @@ func TestOpenCodeProviderSQLiteEventDeltaIsBoundedByChangedSessions(t *testing.T
 	}
 }
 
-func TestOpenCodeProviderSQLiteEventDeltaDoesNotEnumerateHybridSessions(t *testing.T) {
-	root := t.TempDir()
-	dbPath, seeder, db := newTestDBAt(t, filepath.Join(root, "opencode.db"))
-	defer db.Close()
-	seedOpenCodeEventJournal(t, db)
-	seeder.AddProject("prj_hybrid", "/tmp/hybrid")
-	seeder.AddSession("ses_changed", "prj_hybrid", "", "Changed", 1, 2)
-	addOpenCodeEvent(t, db, "evt_001", "ses_changed", "session.created.1", 1)
-	cursor, supported, err := OpenCodeEventCursor(dbPath)
-	require.NoError(t, err)
-	require.True(t, supported)
-
-	storageProject := filepath.Join(root, "storage", "session", "project")
-	require.NoError(t, os.MkdirAll(storageProject, 0o755))
-	for i := range 5000 {
-		path := filepath.Join(storageProject, fmt.Sprintf("ses_stable_%06d.json", i))
-		require.NoError(t, os.WriteFile(path, []byte("{}"), 0o600))
+func TestOpenCodeProviderSQLiteEventDeltaDoesNotListStorageProjects(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory read permissions are not enforced on Windows")
 	}
-	addOpenCodeEvent(t, db, "evt_002", "ses_changed", "message.part.updated.1", 2)
 
-	provider, ok := NewProvider(AgentOpenCode, ProviderConfig{Roots: []string{root}})
-	require.True(t, ok)
-	cursorProvider := provider.(ChangedPathCursorProvider)
-	result, err := cursorProvider.SourcesForChangedPathCursor(
-		context.Background(),
-		ChangedPathRequest{
-			Path:          dbPath,
-			EventKind:     "write",
-			WatchRoot:     root,
-			ChangeCursors: map[string]string{dbPath: cursor},
-		},
-	)
-	require.NoError(t, err)
-	require.Len(t, result.Sources, 1)
-	assert.Equal(t, dbPath+"#ses_changed", result.Sources[0].DisplayPath)
+	for _, projectCount := range []int{10, 1000} {
+		t.Run(fmt.Sprintf("projects_%d", projectCount), func(t *testing.T) {
+			root := t.TempDir()
+			dbPath, seeder, db := newTestDBAt(t, filepath.Join(root, "opencode.db"))
+			defer db.Close()
+			seedOpenCodeEventJournal(t, db)
+			seeder.AddProject("prj_target", "/tmp/target")
+			seeder.AddSession("ses_target", "prj_target", "", "Changed", 1, 2)
+			addOpenCodeEvent(t, db, "evt_001", "ses_target", "session.created.1", 1)
+			cursor, supported, err := OpenCodeEventCursor(dbPath)
+			require.NoError(t, err)
+			require.True(t, supported)
+
+			sessionRoot := filepath.Join(root, "storage", "session")
+			for i := range projectCount {
+				require.NoError(t, os.MkdirAll(
+					filepath.Join(sessionRoot, fmt.Sprintf("prj_%06d", i)),
+					0o755,
+				))
+			}
+			targetDir := filepath.Join(sessionRoot, "prj_target")
+			require.NoError(t, os.MkdirAll(targetDir, 0o755))
+			require.NoError(t, os.WriteFile(
+				filepath.Join(targetDir, "ses_target.json"), []byte("{}"), 0o600,
+			))
+			require.NoError(t, os.Chmod(sessionRoot, 0o111))
+			t.Cleanup(func() { _ = os.Chmod(sessionRoot, 0o755) })
+			if _, err := os.ReadDir(sessionRoot); err == nil {
+				t.Skip("filesystem does not enforce directory read permissions")
+			}
+			addOpenCodeEvent(t, db, "evt_002", "ses_target", "message.part.updated.1", 2)
+
+			provider, ok := NewProvider(AgentOpenCode, ProviderConfig{Roots: []string{root}})
+			require.True(t, ok)
+			cursorProvider := provider.(ChangedPathCursorProvider)
+			result, err := cursorProvider.SourcesForChangedPathCursor(
+				context.Background(),
+				ChangedPathRequest{
+					Path:          dbPath,
+					EventKind:     "write",
+					WatchRoot:     root,
+					ChangeCursors: map[string]string{dbPath: cursor},
+				},
+			)
+			require.NoError(t, err)
+			assert.Empty(t, result.Sources,
+				"the exact storage duplicate should suppress the SQLite source")
+		})
+	}
 }
 
 func TestOpenCodeProviderIgnoresNonDataSQLiteSidecars(t *testing.T) {

@@ -23,6 +23,7 @@ const openCodeStorageFingerprintPrefix = "opencode-storage:v1:"
 // used to detect changes without parsing messages or parts.
 type OpenCodeSessionMeta struct {
 	SessionID   string
+	ProjectID   string
 	VirtualPath string
 	FileMtime   int64
 }
@@ -391,7 +392,11 @@ func ListOpenCodeSessionMetaByID(
 	}
 	defer db.Close()
 
-	stmt, err := db.Prepare("SELECT time_updated FROM session WHERE id = ?")
+	stmt, err := db.Prepare(`
+		SELECT project_id, time_updated
+		FROM session
+		WHERE id = ?
+	`)
 	if err != nil {
 		return nil, fmt.Errorf("preparing opencode session metadata lookup: %w", err)
 	}
@@ -399,8 +404,9 @@ func ListOpenCodeSessionMetaByID(
 
 	metas := make([]OpenCodeSessionMeta, 0, len(sessionIDs))
 	for _, id := range sessionIDs {
+		var projectID string
 		var timeUpdated int64
-		err := stmt.QueryRow(id).Scan(&timeUpdated)
+		err := stmt.QueryRow(id).Scan(&projectID, &timeUpdated)
 		if err == sql.ErrNoRows {
 			continue
 		}
@@ -409,6 +415,7 @@ func ListOpenCodeSessionMetaByID(
 		}
 		metas = append(metas, OpenCodeSessionMeta{
 			SessionID:   id,
+			ProjectID:   projectID,
 			VirtualPath: dbPath + "#" + id,
 			FileMtime:   timeUpdated * 1_000_000,
 		})

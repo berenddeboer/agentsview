@@ -643,7 +643,7 @@ func (s openCodeFormatSourceSet) sqliteSourcesByID(
 	}
 	sources := make([]SourceRef, 0, len(metas))
 	for _, meta := range metas {
-		if s.storageSessionExists(root, meta.SessionID) {
+		if s.storageSessionExists(root, meta.ProjectID, meta.SessionID) {
 			continue
 		}
 		if source, ok := s.sqliteSourceRefFromMeta(root, meta); ok {
@@ -656,26 +656,18 @@ func (s openCodeFormatSourceSet) sqliteSourcesByID(
 
 func (s openCodeFormatSourceSet) storageSessionExists(
 	root string,
+	projectID string,
 	sessionID string,
 ) bool {
 	src := s.spec.resolve(root)
-	if src.Mode != OpenCodeSourceStorage {
+	if src.Mode != OpenCodeSourceStorage ||
+		!IsValidSessionID(projectID) ||
+		!IsValidSessionID(sessionID) {
 		return false
 	}
-	entries, err := os.ReadDir(src.SessionRoot)
-	if err != nil {
-		return false
-	}
-	for _, entry := range entries {
-		if !isDirOrSymlink(entry, src.SessionRoot) {
-			continue
-		}
-		path := filepath.Join(src.SessionRoot, entry.Name(), sessionID+".json")
-		if info, err := os.Stat(path); err == nil && !info.IsDir() {
-			return true
-		}
-	}
-	return false
+	path := filepath.Join(src.SessionRoot, projectID, sessionID+".json")
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 func (s openCodeFormatSourceSet) sqliteDeltaForChangedPathInRoot(
