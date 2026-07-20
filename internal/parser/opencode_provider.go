@@ -667,7 +667,7 @@ func (s openCodeFormatSourceSet) storageSessionExists(
 	}
 	path := filepath.Join(src.SessionRoot, projectID, sessionID+".json")
 	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
+	return err == nil && info != nil && !info.IsDir()
 }
 
 func (s openCodeFormatSourceSet) sqliteDeltaForChangedPathInRoot(
