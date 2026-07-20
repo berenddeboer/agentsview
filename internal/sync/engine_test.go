@@ -4661,6 +4661,113 @@ func (p *shutdownBlockingChangedPathProvider) Parse(
 	return parser.ParseOutcome{}, nil
 }
 
+func TestEnginePersistentChangedPathFailureRetriesOnlyOnce(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "changed.db")
+	require.NoError(t, os.WriteFile(path, []byte("changed"), 0o600))
+	provider := &persistentFailureCursorProvider{
+		ProviderBase: parser.ProviderBase{
+			Def: parser.AgentDef{
+				Type: parser.AgentCowork, IDPrefix: "cowork:", FileBased: true,
+			},
+			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+				ClassifyChangedPath: parser.CapabilitySupported,
+			}},
+		},
+		root: root,
+		path: path,
+	}
+	engine := NewEngine(openTestDB(t), EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCowork: {root},
+		},
+		ProviderFactories: []parser.ProviderFactory{
+			persistentFailureCursorFactory{provider: provider},
+		},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			parser.AgentCowork: parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	t.Cleanup(engine.Close)
+
+	engine.SyncPaths([]string{path})
+	require.Equal(t, int32(1), provider.parseCalls.Load())
+	require.Eventually(t, func() bool {
+		return provider.parseCalls.Load() == 2
+	}, 2*time.Second, 10*time.Millisecond)
+	time.Sleep(1200 * time.Millisecond)
+	assert.Equal(t, int32(2), provider.parseCalls.Load(),
+		"a failed retry must wait for a new watcher or full-sync pass")
+}
+
+type persistentFailureCursorFactory struct {
+	provider *persistentFailureCursorProvider
+}
+
+func (f persistentFailureCursorFactory) Definition() parser.AgentDef {
+	return f.provider.Definition()
+}
+
+func (f persistentFailureCursorFactory) Capabilities() parser.Capabilities {
+	return f.provider.Capabilities()
+}
+
+func (f persistentFailureCursorFactory) NewProvider(
+	parser.ProviderConfig,
+) parser.Provider {
+	return f.provider
+}
+
+type persistentFailureCursorProvider struct {
+	parser.ProviderBase
+	root       string
+	path       string
+	parseCalls atomic.Int32
+}
+
+func (p *persistentFailureCursorProvider) WatchPlan(
+	context.Context,
+) (parser.WatchPlan, error) {
+	return parser.WatchPlan{Roots: []parser.WatchRoot{{Path: p.root}}}, nil
+}
+
+func (p *persistentFailureCursorProvider) CurrentChangedPathCursors(
+	context.Context,
+) ([]parser.ChangedPathCursor, error) {
+	return nil, nil
+}
+
+func (p *persistentFailureCursorProvider) SourcesForChangedPathCursor(
+	_ context.Context,
+	req parser.ChangedPathRequest,
+) (parser.ChangedPathCursorResult, error) {
+	return parser.ChangedPathCursorResult{
+		Sources: []parser.SourceRef{{
+			Provider:       parser.AgentCowork,
+			Key:            p.path,
+			DisplayPath:    p.path,
+			FingerprintKey: p.path,
+			ContentChanged: true,
+		}},
+		Retries: []parser.ChangedPathRetry{{Key: req.Path}},
+	}, nil
+}
+
+func (p *persistentFailureCursorProvider) Fingerprint(
+	context.Context,
+	parser.SourceRef,
+) (parser.SourceFingerprint, error) {
+	return parser.SourceFingerprint{Key: p.path, MTimeNS: 1, Size: 1}, nil
+}
+
+func (p *persistentFailureCursorProvider) Parse(
+	context.Context,
+	parser.ParseRequest,
+) (parser.ParseOutcome, error) {
+	p.parseCalls.Add(1)
+	return parser.ParseOutcome{}, errors.New("persistent parse failure")
+}
+
 func TestEngineSyncAllSinceDoesNotAdvanceOpenCodeEventCursor(t *testing.T) {
 	database := openTestDB(t)
 	root := t.TempDir()

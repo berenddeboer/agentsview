@@ -304,6 +304,58 @@ func TestListOpenCodeEventDelta(t *testing.T) {
 	assert.Equal(t, []string{"ses_a", "ses_b"}, delta.SessionIDs)
 }
 
+func TestListOpenCodeEventDeltaFallsBackWhenDatabaseIsReplacedAndAdvances(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	dbPath, seeder, original := newTestDBAt(t, filepath.Join(root, "opencode.db"))
+	seedOpenCodeEventJournal(t, original)
+	seeder.AddProject("prj_events", "/tmp/events")
+	seeder.AddSession("ses_a", "prj_events", "", "A", 1, 2)
+	addOpenCodeEvent(t, original, "evt_boundary", "ses_a", "session.created.1", 1)
+	cursor, supported, err := OpenCodeEventCursor(dbPath)
+	require.NoError(t, err)
+	require.True(t, supported)
+	previous, err := decodeOpenCodeEventCursor(cursor)
+	require.NoError(t, err)
+	require.NoError(t, original.Close())
+
+	replacementPath := filepath.Join(root, "replacement.db")
+	_, replacementSeeder, replacement := newTestDBAt(t, replacementPath)
+	seedOpenCodeEventJournal(t, replacement)
+	replacementSeeder.AddProject("prj_events", "/tmp/events")
+	replacementSeeder.AddSession("ses_a", "prj_events", "", "A", 1, 2)
+	replacementSeeder.AddSession("ses_b", "prj_events", "", "B", 1, 2)
+	replacementSeeder.AddSession(
+		"ses_unjournaled", "prj_events", "", "Unjournaled", 1, 2,
+	)
+	addOpenCodeEvent(
+		t, replacement, "evt_boundary", "ses_a", "session.created.1", 1,
+	)
+	addOpenCodeEvent(
+		t, replacement, "evt_new", "ses_b", "session.updated.1", 1,
+	)
+	require.NoError(t, replacement.Close())
+	require.NoError(t, os.Remove(dbPath))
+	require.NoError(t, os.Rename(replacementPath, dbPath))
+
+	current, ok := StatSQLiteContainerState(dbPath)
+	require.True(t, ok)
+	if previous.State.DBInode == 0 || current.DBInode == 0 {
+		t.Skip("filesystem does not expose stable file identity")
+	}
+	require.True(t,
+		previous.State.DBInode != current.DBInode ||
+			previous.State.DBDevice != current.DBDevice,
+		"test replacement must change file identity")
+
+	delta, err := ListOpenCodeEventDelta(dbPath, cursor)
+	require.NoError(t, err)
+	assert.True(t, delta.Supported)
+	assert.False(t, delta.Complete,
+		"replacement must force discovery even when the old boundary remains")
+}
+
 func TestListOpenCodeEventDeltaCoalescesActiveSessionsIndependently(t *testing.T) {
 	dbPath, seeder, db := newTestDB(t)
 	defer db.Close()

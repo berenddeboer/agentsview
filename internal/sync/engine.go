@@ -632,6 +632,14 @@ func lockMutexContext(ctx context.Context, mu *gosync.Mutex) bool {
 // that ignored SIGTERM would hold shutdown until a service manager's kill
 // timeout instead of aborting between files like every other sync path.
 func (e *Engine) SyncPathsContext(ctx context.Context, paths []string) {
+	e.syncPathsContext(ctx, paths, false)
+}
+
+func (e *Engine) syncPathsContext(
+	ctx context.Context,
+	paths []string,
+	retryPass bool,
+) {
 	if e.refuseWriteInForceParse("SyncPaths") {
 		return
 	}
@@ -683,7 +691,10 @@ func (e *Engine) SyncPathsContext(ctx context.Context, paths []string) {
 	if !stats.Aborted && stats.Failed == 0 && ctx.Err() == nil {
 		e.promoteChangedPathCursors(cursorUpdates)
 		e.updateChangedPathRetries(retryUpdates)
-	} else {
+	} else if !retryPass {
+		// A fresh watcher event gets one automatic retry. If that retry also
+		// fails, wait for another watcher event or the periodic full sync
+		// instead of polling a persistent parse failure forever.
 		e.rescheduleFailedChangedPathRetries(retryUpdates)
 	}
 	e.anomalies.applyTo(&stats)
@@ -1047,7 +1058,7 @@ func (e *Engine) updateChangedPathRetries(retries []parser.ChangedPathRetry) {
 			closed := e.changedPathRetryClosed
 			e.changedPathRetryMu.Unlock()
 			if !closed {
-				e.SyncPathsContext(e.changedPathRetryCtx, []string{key})
+				e.syncPathsContext(e.changedPathRetryCtx, []string{key}, true)
 			}
 			e.changedPathRetryWG.Done()
 		})

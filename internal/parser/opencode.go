@@ -167,8 +167,13 @@ func listOpenCodeEventDeltaAt(
 			return OpenCodeEventDelta{}, fmt.Errorf("reading opencode event boundary: %w", err)
 		}
 	}
+	replaced := previous.State.DBInode != 0 &&
+		state.DBInode != 0 &&
+		(previous.State.DBInode != state.DBInode ||
+			previous.State.DBDevice != state.DBDevice)
 	if high < previous.RowID ||
 		boundaryReused ||
+		replaced ||
 		(high == previous.RowID && state != previous.State) {
 		return OpenCodeEventDelta{Supported: true}, nil
 	}
