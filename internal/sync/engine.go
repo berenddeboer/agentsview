@@ -620,7 +620,7 @@ func (e *Engine) SyncPathsContext(ctx context.Context, paths []string) {
 
 	// Capture container states before classifyPaths lists any session rows,
 	// matching the capture-before-discovery ordering of full syncs.
-	preContainerStates := e.captureSQLiteContainerStates()
+	preContainerStates := e.captureSQLiteContainerStates(paths)
 	e.pendingChangedCursors = make(map[string]string)
 	e.pendingChangedRetries = make([]parser.ChangedPathRetry, 0)
 	files := e.classifyPaths(paths)
@@ -791,7 +791,9 @@ func (e *Engine) classifyProviderChangedPath(
 				var err error
 				storedSourcePaths, err = e.db.ListStoredSourcePathHints(
 					string(def.Type),
-					[]string{watchRoot},
+					providerChangedPathStoredHintRoots(
+						agentType, watchRoot, path,
+					),
 				)
 				if err != nil {
 					log.Printf(
@@ -1063,15 +1065,38 @@ func providerChangedPathForceParse(
 }
 
 func providerVirtualSourceBackedByEvent(sourcePath, eventPath string) bool {
-	idx := strings.LastIndex(sourcePath, "#")
-	if idx < 0 {
-		return false
+	sourcePath = filepath.Clean(sourcePath)
+	dbPath := sourcePath
+	if idx := strings.LastIndex(sourcePath, "#"); idx >= 0 {
+		dbPath = filepath.Clean(sourcePath[:idx])
 	}
-	dbPath := filepath.Clean(sourcePath[:idx])
 	eventPath = filepath.Clean(eventPath)
+	// The workspace.json branch is keyed on the VS Code style state store
+	// basename, which Windsurf and Trae both use, so it covers every
+	// provider whose container is a "state.vscdb" sibling of the workspace
+	// label file rather than Windsurf alone.
 	return eventPath == dbPath ||
 		eventPath == dbPath+"-wal" ||
-		eventPath == dbPath+"-shm"
+		eventPath == dbPath+"-shm" ||
+		(filepath.Base(dbPath) == parser.WindsurfStateDBName &&
+			eventPath == filepath.Join(filepath.Dir(dbPath), "workspace.json"))
+}
+
+func providerChangedPathStoredHintRoots(
+	agent parser.AgentType,
+	watchRoot string,
+	path string,
+) []string {
+	watchRoot = filepath.Clean(watchRoot)
+	if agent != parser.AgentTrae {
+		return []string{watchRoot}
+	}
+	root := filepath.Dir(watchRoot)
+	dbPath, ok := parser.TraeDBPathForEvent(root, path)
+	if !ok {
+		return []string{watchRoot}
+	}
+	return []string{dbPath}
 }
 
 func providerChangedPathEventKind(path string) string {
@@ -2633,7 +2658,7 @@ func (e *Engine) syncAllLocked(
 	// Container states must be captured BEFORE discovery lists any session
 	// rows, so a promoted state can never be newer than the discovered
 	// session set (see captureSQLiteContainerStates).
-	preContainerStates := e.captureSQLiteContainerStates()
+	preContainerStates := e.captureSQLiteContainerStates(nil)
 
 	var all []parser.DiscoveredFile
 	counts := make(map[parser.AgentType]int)
@@ -4872,15 +4897,14 @@ func (e *Engine) processProviderFile(
 
 // dropUnchangedSharedSQLiteResults reproduces the legacy per-session skip the
 // folded processZed/processShelley loops and the aiderFileUnchanged check
-// performed. Zed and Shelley keep every session in one shared SQLite database,
-// and Aider fans every run out of one shared history file, so the provider
-// re-parses every session on any change to that shared source. Without a
-// per-session filter the engine would rewrite and recount unchanged sessions.
-// This drops results whose stored file_mtime (and, for Shelley's
-// second-precision timestamps and Aider's whole-file content hash, the
-// fingerprint stored in file_hash) and data_version already match, using the
-// path rewriter so remote stored paths resolve. Force-parse runs (parse-diff,
-// single-session resync) keep every result so they always re-emit.
+// performed. Zed, Shelley, and Trae keep every session in one shared SQLite
+// database, and Aider fans every run out of one shared history file, so the
+// provider re-parses every session on any change to that shared source.
+// Without a per-session filter the engine would rewrite and recount unchanged
+// sessions. This drops results whose stored file_mtime and, when available, the
+// fingerprint stored in file_hash already match, using the path rewriter so
+// remote stored paths resolve. Force-parse runs (parse-diff, single-session
+// resync) keep every result so they always re-emit.
 func (e *Engine) dropUnchangedSharedSQLiteResults(
 	file parser.DiscoveredFile,
 	results []parser.ParseResult,
@@ -4891,6 +4915,12 @@ func (e *Engine) dropUnchangedSharedSQLiteResults(
 	compareHash := false
 	switch file.Agent {
 	case parser.AgentShelley:
+		compareHash = true
+	case parser.AgentTrae:
+		// Trae fans one shared SQLite store out into virtual per-session paths.
+		// Every session shares the container fingerprint hash, which catches
+		// same-mtime rewrites while still letting unchanged sessions drop after
+		// the provider re-parses the container.
 		compareHash = true
 	case parser.AgentAider:
 		// Every aider run in a history file shares the file's content hash, so
@@ -5327,6 +5357,14 @@ func (e *Engine) shouldCacheSkip(
 			return false
 		}
 		if _, _, ok := parser.ParseVirtualSourcePathForBase(file.Path, shelleyDBFile); ok {
+			return false
+		}
+	}
+	if file.Agent == parser.AgentTrae {
+		if filepath.Base(file.Path) == "state.vscdb" {
+			return false
+		}
+		if _, _, ok := parser.SplitTraeVirtualPath(file.Path); ok {
 			return false
 		}
 	}

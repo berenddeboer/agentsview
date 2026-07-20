@@ -76,6 +76,32 @@ func TestSQLiteContainerPassPromotesOnlyPreDiscoveryCaptures(t *testing.T) {
 	})
 }
 
+func TestCaptureSQLiteContainerStatesScopesChangedPathToImpactedContainer(t *testing.T) {
+	firstDB, _ := newContainerTestDB(t)
+	secondDB, _ := newContainerTestDB(t)
+	engine := &Engine{
+		agentDirs: map[parser.AgentType][]string{
+			parser.AgentOpenCode: {
+				filepath.Dir(firstDB),
+				filepath.Dir(secondDB),
+			},
+		},
+	}
+
+	origStat := statSQLiteContainerState
+	t.Cleanup(func() { statSQLiteContainerState = origStat })
+	var statPaths []string
+	statSQLiteContainerState = func(dbPath string) (parser.SQLiteContainerState, bool) {
+		statPaths = append(statPaths, filepath.Clean(dbPath))
+		return parser.StatSQLiteContainerState(dbPath)
+	}
+
+	states := engine.captureSQLiteContainerStates([]string{firstDB + "-wal"})
+	require.Contains(t, states, firstDB)
+	require.NotContains(t, states, secondDB)
+	assert.Equal(t, []string{filepath.Clean(firstDB)}, statPaths)
+}
+
 // TestSQLiteContainerPassFailsOnCaptureDiscoveryMismatch pins the pass's
 // recapture check: a container that changed between the pre-discovery
 // capture and pass begin must neither gate-skip nor be promoted. The

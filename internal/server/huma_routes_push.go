@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -149,6 +151,12 @@ type daemonPushRequest struct {
 	// NoVectors carries the CLI --no-vectors flag, which has no daemon-side
 	// flag of its own, into the push handler's vector-source gate.
 	NoVectors bool `json:"no_vectors,omitempty"`
+	// Automatic is set by the CLI's watch-mode DuckDB pushes: a mirror
+	// held by a live serve process defers instead of rebuilding the whole
+	// archive on every changed batch, and archive-scale diagnostics are
+	// skipped (see duckdbsync.SyncOptions.Automatic). Explicit pushes
+	// leave it unset and do neither.
+	Automatic bool `json:"automatic,omitempty"`
 }
 
 // WithVectorPushSource wires the local vectors.db push source used by the
@@ -189,27 +197,64 @@ func (s *Server) pgPushConfig(req daemonPushRequest) (config.PGConfig, error) {
 	return s.cfg.ResolvePG()
 }
 
+// duckDBPushConfig resolves the DuckDB config a daemon push writes to. The
+// mirror PATH is always the server's own resolved configuration: the request
+// body is attacker-reachable for any authenticated API caller, and honoring a
+// caller-supplied path verbatim would let a push's rebuild rename a DuckDB
+// mirror over any file the daemon can write (including the primary
+// sessions.db). Non-path fields from a request-supplied config (machine
+// name, filters, url — the latter still rejected by ValidatePushTarget)
+// keep applying as before; a request that names a different path than the
+// server's is rejected instead of redirected.
+//
+// The CLI never sends a path (it defers to the server's pinned path): the
+// normalization below absolutizes relative paths against THIS process's
+// cwd, so a configured relative path could absolutize differently in the
+// CLI and the daemon and spuriously fail the equality check. The mismatch
+// rejection stays for third-party API callers.
 func (s *Server) duckDBPushConfig(
 	req daemonPushRequest,
 ) (config.DuckDBConfig, error) {
-	if req.DuckDB != nil {
-		return *req.DuckDB, nil
+	resolved, err := s.cfg.ResolveDuckDB()
+	if err != nil {
+		return config.DuckDBConfig{}, err
 	}
-	return s.cfg.ResolveDuckDB()
+	if req.DuckDB == nil {
+		return resolved, nil
+	}
+	duckCfg := *req.DuckDB
+	requested := normalizeDuckDBMirrorPath(duckCfg.Path)
+	if requested != "" && requested != normalizeDuckDBMirrorPath(resolved.Path) {
+		return config.DuckDBConfig{}, fmt.Errorf(
+			"daemon duckdb pushes write only the server-configured mirror path %s; "+
+				"requested path %s is not allowed — change the server's "+
+				"[duckdb].path (or AGENTSVIEW_DUCKDB_PATH) to push to a "+
+				"different file", resolved.Path, duckCfg.Path,
+		)
+	}
+	duckCfg.Path = resolved.Path
+	return duckCfg, nil
 }
 
-func duckDBPushSyncOptions(
-	req daemonPushRequest,
-	duckCfg config.DuckDBConfig,
-) duckdbsync.SyncOptions {
-	syncStateTarget := req.SyncStateTarget
-	if syncStateTarget == "" {
-		syncStateTarget = duckdbsync.SyncStateTargetForConfig(duckCfg)
+// normalizeDuckDBMirrorPath canonicalizes a mirror path for the equality
+// check above; "" stays "" so an unset request path always defers to the
+// server's own path.
+func normalizeDuckDBMirrorPath(path string) string {
+	if path == "" {
+		return ""
 	}
+	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	return abs
+}
+
+func duckDBPushSyncOptions(req daemonPushRequest) duckdbsync.SyncOptions {
 	return duckdbsync.SyncOptions{
 		Projects:        req.Projects,
 		ExcludeProjects: req.ExcludeProjects,
-		SyncStateTarget: syncStateTarget,
+		Automatic:       req.Automatic,
 	}
 }
 
@@ -306,7 +351,7 @@ func (s *Server) humaDuckDBPush(
 	}
 
 	engine := s.syncEngineForLocal(local)
-	opts := duckDBPushSyncOptions(in.Body, duckCfg)
+	opts := duckDBPushSyncOptions(in.Body)
 	body := in.Body
 	return &huma.StreamResponse{Body: func(hctx huma.Context) {
 		runPushStream(hctx, func(
@@ -318,27 +363,12 @@ func (s *Server) humaDuckDBPush(
 			var result duckdbsync.PushResult
 			_, err := engine.SyncThenRun(ctx, body.Full, nil,
 				func(forceFull bool) error {
-					var syncer *duckdbsync.Sync
-					var err error
-					if duckCfg.URL != "" {
-						syncer, err = duckdbsync.NewFromConfig(
-							duckCfg, local, opts,
-						)
-					} else {
-						syncer, err = duckdbsync.New(
-							duckCfg.Path, local, duckCfg.MachineName,
-							opts,
-						)
-					}
-					if err != nil {
-						return err
-					}
-					defer syncer.Close()
-					if err := syncer.EnsureSchema(ctx); err != nil {
-						return err
-					}
-					result, err = syncer.Push(ctx, forceFull, onProgress)
-					return err
+					var pushErr error
+					result, pushErr = duckdbsync.Push(
+						ctx, duckCfg.Path, local, duckCfg.MachineName,
+						opts, forceFull, onProgress,
+					)
+					return pushErr
 				})
 			return result, err
 		})

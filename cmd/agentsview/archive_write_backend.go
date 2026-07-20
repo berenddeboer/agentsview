@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	stdsync "sync"
 	"time"
 
@@ -197,7 +196,7 @@ func (b daemonArchiveWriteBackend) DuckDBPush(
 	projects []string,
 	excludeProjects []string,
 ) (duckdbsync.PushResult, error) {
-	return b.duckDBPush(ctx, duckCfg, cfg, projects, excludeProjects, "")
+	return b.duckDBPush(ctx, duckCfg, cfg, projects, excludeProjects)
 }
 
 func (b daemonArchiveWriteBackend) DuckDBPushWatch(
@@ -218,6 +217,11 @@ func (b daemonArchiveWriteBackend) DuckDBPushWatch(
 	push := func(pctx context.Context, reason pushReason, full bool) error {
 		pushCfg := cfg
 		pushCfg.Full = full
+		// Watch pushes are automatic: a mirror held by a live serve
+		// process defers instead of rebuilding the whole archive on
+		// every changed batch, and archive-scale diagnostics are
+		// skipped. Push ignores the defer behavior when full is set.
+		pushCfg.Automatic = true
 		backend := archiveWriteBackend(b)
 		cleanup := func() {}
 		if reason != reasonStartup {
@@ -274,18 +278,17 @@ func (b daemonArchiveWriteBackend) duckDBPush(
 	cfg DuckDBPushConfig,
 	projects []string,
 	excludeProjects []string,
-	syncStateTarget string,
 ) (duckdbsync.PushResult, error) {
 	if err := duckdbsync.ValidatePushTarget(duckCfg); err != nil {
 		return duckdbsync.PushResult{}, err
 	}
-	duckCfg, err := absolutizeDuckDBPath(duckCfg)
-	if err != nil {
-		return duckdbsync.PushResult{}, err
-	}
-	if syncStateTarget == "" {
-		syncStateTarget = duckdbsync.SyncStateTargetForConfig(duckCfg)
-	}
+	// Never send a mirror path to the daemon: the daemon pins pushes to its
+	// own resolved path and rejects any request naming a different one, and
+	// a configured RELATIVE path absolutizes against each process's cwd, so
+	// the CLI and daemon can disagree on the absolute form of the same
+	// configured path. An empty path defers to the server's pinned path;
+	// non-path fields (machine name, filters) still apply.
+	duckCfg.Path = ""
 	onProgress, finish := daemonPushProgress(
 		"DuckDB", func(p duckdbsync.PushProgress) {
 			fmt.Printf(
@@ -302,24 +305,10 @@ func (b daemonArchiveWriteBackend) duckDBPush(
 			Projects:        projects,
 			ExcludeProjects: excludeProjects,
 			DuckDB:          &duckCfg,
-			SyncStateTarget: syncStateTarget,
+			Automatic:       cfg.Automatic,
 		},
 		onProgress,
 	)
-}
-
-func absolutizeDuckDBPath(
-	duckCfg config.DuckDBConfig,
-) (config.DuckDBConfig, error) {
-	if duckCfg.Path == "" || filepath.IsAbs(duckCfg.Path) {
-		return duckCfg, nil
-	}
-	abs, err := filepath.Abs(duckCfg.Path)
-	if err != nil {
-		return duckCfg, fmt.Errorf("resolving duckdb path: %w", err)
-	}
-	duckCfg.Path = abs
-	return duckCfg, nil
 }
 
 func (b daemonArchiveWriteBackend) PGPushWatch(
@@ -481,9 +470,7 @@ func (b *localArchiveWriteBackend) DuckDBPush(
 	projects []string,
 	excludeProjects []string,
 ) (duckdbsync.PushResult, error) {
-	return b.duckDBPush(
-		ctx, duckCfg, cfg, projects, excludeProjects, "",
-	)
+	return b.duckDBPush(ctx, duckCfg, cfg, projects, excludeProjects)
 }
 
 func (b *localArchiveWriteBackend) duckDBPush(
@@ -492,7 +479,6 @@ func (b *localArchiveWriteBackend) duckDBPush(
 	cfg DuckDBPushConfig,
 	projects []string,
 	excludeProjects []string,
-	syncStateTarget string,
 ) (duckdbsync.PushResult, error) {
 	if err := duckdbsync.ValidatePushTarget(duckCfg); err != nil {
 		return duckdbsync.PushResult{}, err
@@ -502,48 +488,15 @@ func (b *localArchiveWriteBackend) duckDBPush(
 		return duckdbsync.PushResult{}, err
 	}
 	forceFull := cfg.Full || didResync
-	if syncStateTarget == "" {
-		syncStateTarget = duckdbsync.SyncStateTargetForConfig(duckCfg)
-	}
 
-	fmt.Println("Opening DuckDB mirror...")
-	connectStart := time.Now()
+	fmt.Println("Starting DuckDB push...")
 	opts := duckdbsync.SyncOptions{
 		Projects:        projects,
 		ExcludeProjects: excludeProjects,
-		SyncStateTarget: syncStateTarget,
+		Automatic:       cfg.Automatic,
 	}
-	var syncer *duckdbsync.Sync
-	var err error
-	if duckCfg.URL != "" {
-		syncer, err = duckdbsync.NewFromConfig(
-			duckCfg, b.database, opts,
-		)
-	} else {
-		syncer, err = duckdbsync.New(
-			duckCfg.Path, b.database, duckCfg.MachineName, opts,
-		)
-	}
-	if err != nil {
-		return duckdbsync.PushResult{}, err
-	}
-	defer syncer.Close()
-	fmt.Printf(
-		"Opened DuckDB mirror in %s\n",
-		time.Since(connectStart).Round(time.Millisecond),
-	)
-
-	fmt.Println("Preparing DuckDB schema...")
-	schemaStart := time.Now()
-	if err := syncer.EnsureSchema(ctx); err != nil {
-		return duckdbsync.PushResult{}, fmt.Errorf("schema: %w", err)
-	}
-	fmt.Printf(
-		"DuckDB schema ready in %s\n",
-		time.Since(schemaStart).Round(time.Millisecond),
-	)
-	fmt.Println("Starting DuckDB push...")
-	result, err := syncer.Push(ctx, forceFull,
+	result, err := duckdbsync.Push(
+		ctx, duckCfg.Path, b.database, duckCfg.MachineName, opts, forceFull,
 		func(p duckdbsync.PushProgress) {
 			fmt.Printf(
 				"\rPushing... %d/%d sessions, %d messages\x1b[K",
@@ -576,6 +529,11 @@ func (b *localArchiveWriteBackend) DuckDBPushWatch(
 	push := func(pctx context.Context, reason pushReason, full bool) error {
 		pushCfg := cfg
 		pushCfg.Full = full
+		// Watch pushes are automatic: a mirror held by a live serve
+		// process defers instead of rebuilding the whole archive on
+		// every changed batch, and archive-scale diagnostics are
+		// skipped. Push ignores the defer behavior when full is set.
+		pushCfg.Automatic = true
 		res, err := b.DuckDBPush(pctx, duckCfg, pushCfg, projects, exclude)
 		if err != nil {
 			return err
@@ -613,13 +571,17 @@ func (b *localArchiveWriteBackend) DuckDBPushWatch(
 }
 
 func logDuckDBWatchPushResult(res duckdbsync.PushResult, reason pushReason) {
+	if res.Diagnostics.Deferred {
+		log.Printf(
+			"duckdb watch: push deferred: %s (%s)",
+			res.Diagnostics.DeferredReason, reason,
+		)
+		return
+	}
 	if res.Diagnostics.Cutoff != "" {
 		log.Printf(
-			"duckdb watch: source local %s; candidates %s; skipped unchanged %s; stale deleted %d; wrote sessions %s, messages %d (%s)",
-			formatDuckDBPushSessionCounts(res.Diagnostics.LocalSessions),
-			formatDuckDBPushSessionCounts(res.Diagnostics.CandidateSessions),
-			formatDuckDBPushSessionCounts(res.Diagnostics.SkippedUnchangedSessions),
-			res.Diagnostics.DeletedStaleSessions,
+			"duckdb watch: source %s; wrote sessions %s, messages %d (%s)",
+			formatDuckDBPushSource(res.Diagnostics),
 			formatDuckDBPushSessionCounts(res.Diagnostics.PushedSessions),
 			res.MessagesPushed,
 			reason,

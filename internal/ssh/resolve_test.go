@@ -25,6 +25,9 @@ func TestBuildResolveScript(t *testing.T) {
 		want := def.FileBased &&
 			parser.ProviderMigrationModes()[def.Type] ==
 				parser.ProviderMigrationProviderAuthoritative
+		if def.Type == parser.AgentTrae {
+			want = false
+		}
 		if want {
 			assert.True(t, resolveScriptMentionsAgent(script, def.Type),
 				"file-backed provider-authoritative agent %s missing from script", def.Type)
@@ -52,6 +55,18 @@ func TestResolveScriptExcludesDevinProviderRoot(t *testing.T) {
 	assert.NotContains(t, dirs, parser.AgentDevin)
 }
 
+func TestResolveScriptExcludesTraeProfile(t *testing.T) {
+	home := t.TempDir()
+	traeRoot := filepath.Join(home, "AppData", "Roaming", "TRAE", "User")
+	claudeRoot := filepath.Join(home, ".claude", "projects")
+	require.NoError(t, os.MkdirAll(traeRoot, 0o755))
+	require.NoError(t, os.MkdirAll(claudeRoot, 0o755))
+
+	out := runResolveScriptForTest(t, "HOME="+home, "TRAE_DIR="+traeRoot)
+	dirs, _ := parseResolvedDirs(string(out))
+	assert.NotContains(t, dirs, parser.AgentTrae)
+}
+
 func TestResolveScriptHonorsClaudeConfigDirRoot(t *testing.T) {
 	home := t.TempDir()
 	root := filepath.Join(home, "claude personal")
@@ -75,13 +90,10 @@ func TestResolveScriptTreatsEnvValuesAsData(t *testing.T) {
 
 	script := buildResolveScript()
 	require.NotContains(t, script, "eval")
-	cmd := exec.Command("sh", "-c", script)
-	cmd.Env = []string{
-		"HOME=" + home,
-		"CLAUDE_PROJECTS_DIR=" + projectsDir,
-	}
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "resolve script failed: output: %s", out)
+	out := runResolveScriptForTest(t,
+		"HOME="+home,
+		"CLAUDE_PROJECTS_DIR="+projectsDir,
+	)
 
 	dirs, _ := parseResolvedDirs(string(out))
 	assert.Contains(t, dirs[parser.AgentClaude], projectsDir)

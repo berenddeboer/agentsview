@@ -1482,6 +1482,13 @@ func (db *DB) LinkSubagentSessions() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	// local_modified_at is bumped so the sync_marker trigger fires and
+	// push targets (PostgreSQL and the DuckDB mirror) re-select the linked
+	// session: parent_session_id and relationship_type are mirrored
+	// columns, but neither is a sync_marker signal, so linking an older
+	// session after a mirror's cutoff would otherwise never re-push it
+	// (see updateSessionSignalsTx and ReplaceSessionUsageEvents for the
+	// same pattern).
 	_, err := db.getWriter().Exec(`
 		UPDATE sessions
 		SET parent_session_id = (
@@ -1490,7 +1497,8 @@ func (db *DB) LinkSubagentSessions() error {
 			WHERE tc.subagent_session_id = sessions.id
 			LIMIT 1
 		),
-		relationship_type = 'subagent'
+		relationship_type = 'subagent',
+		local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		WHERE relationship_type != 'subagent'
 		AND EXISTS (
 			SELECT 1 FROM tool_calls tc
@@ -3248,6 +3256,163 @@ func (db *DB) ListSessionsModifiedBetween(
 		sessions = append(sessions, s)
 	}
 	return sessions, rows.Err()
+}
+
+// ListSessionsForMirrorWindow returns sessions whose sync_marker lies in
+// [since, +inf); the lower bound is inclusive and an empty since is
+// unbounded. The marker is the trigger-maintained max of the four sync
+// signals, so "marker >= since" is equivalent to "any signal >= since".
+// Inclusive selection is required for mirror pushes: a boundary-equal
+// update must be re-selected (the caller dedupes with fingerprints).
+//
+// The window deliberately has no upper bound. The marker is a MAX over
+// timestamp signals, so one future-dated signal (for example a
+// clock-skewed file_mtime) pushes it past any wall-clock cutoff; an upper
+// bound would then exclude the session from every incremental window
+// until wall time caught up, leaving later real changes (content,
+// local_modified_at) unmirrored. Without the bound such a session is
+// merely a perpetual candidate whose unchanged fingerprint is cheaply
+// skipped on each push.
+func (db *DB) ListSessionsForMirrorWindow(
+	ctx context.Context, since string,
+	projects, excludeProjects []string,
+) ([]Session, error) {
+	query := "SELECT " + sessionFullCols + " FROM sessions"
+	var (
+		args  []any
+		where []string
+	)
+	if since != "" {
+		normalized, err := normalizeMirrorWindowBound(since)
+		if err != nil {
+			return nil, err
+		}
+		where = append(where, "sync_marker >= ?")
+		args = append(args, normalized)
+	}
+	if len(projects) > 0 {
+		placeholders := make([]string, len(projects))
+		for i, p := range projects {
+			placeholders[i] = "?"
+			args = append(args, p)
+		}
+		where = append(where, "project IN ("+strings.Join(placeholders, ", ")+")")
+	}
+	if len(excludeProjects) > 0 {
+		placeholders := make([]string, len(excludeProjects))
+		for i, p := range excludeProjects {
+			placeholders[i] = "?"
+			args = append(args, p)
+		}
+		where = append(where, "project NOT IN ("+strings.Join(placeholders, ", ")+")")
+	}
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " ORDER BY created_at"
+
+	rows, err := db.getReader().QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"listing sessions for mirror window since %s: %w", since, err,
+		)
+	}
+	defer rows.Close()
+
+	var sessions []Session
+	for rows.Next() {
+		var s Session
+		err := rows.Scan(
+			&s.ID, &s.Project, &s.Machine, &s.Agent,
+			&s.AgentLabel, &s.Entrypoint,
+			&s.FirstMessage, &s.DisplayName, &s.SessionName, &s.StartedAt, &s.EndedAt,
+			&s.MessageCount, &s.UserMessageCount,
+			&s.ParentSessionID, &s.RelationshipType,
+			&s.TotalOutputTokens, &s.PeakContextTokens,
+			&s.HasTotalOutputTokens, &s.HasPeakContextTokens,
+			&s.IsAutomated,
+			&s.ToolFailureSignalCount, &s.ToolRetryCount,
+			&s.EditChurnCount, &s.ConsecutiveFailureMax,
+			&s.Outcome, &s.OutcomeConfidence,
+			&s.EndedWithRole, &s.FinalFailureStreak,
+			&s.SignalsPendingSince,
+			&s.CompactionCount, &s.MidTaskCompactionCount,
+			&s.ContextPressureMax,
+			&s.HealthScore, &s.HealthGrade,
+			&s.HasToolCalls, &s.HasContextData,
+			&s.SecretLeakCount, &s.SecretsRulesVersion,
+			&s.QualitySignalVersion,
+			&s.ShortPromptCount, &s.UnstructuredStart,
+			&s.MissingSuccessCriteriaCount,
+			&s.MissingVerificationCount, &s.DuplicatePromptCount,
+			&s.NoCodeContextCount, &s.RunawayToolLoopCount,
+			&s.DataVersion,
+			&s.Cwd, &s.GitBranch,
+			&s.SourceSessionID, &s.SourceVersion,
+			&s.TranscriptFidelity,
+			&s.ParserMalformedLines, &s.IsTruncated,
+			&s.LastWriteIncremental,
+			&s.DeletedAt, &s.TerminationStatus, &s.FilePath, &s.FileSize,
+			&s.FileMtime, &s.NextOrdinal, &s.LastEntryUUID,
+			&s.FileInode, &s.FileDevice,
+			&s.FileHash, &s.LocalModifiedAt,
+			&s.TranscriptRevision, &s.CreatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scanning session: %w", err)
+		}
+		sessions = append(sessions, s)
+	}
+	return sessions, rows.Err()
+}
+
+// CountSessionsForMirrorScope returns the number of sessions in the given
+// project scope, matching ListSessionsForMirrorWindow's project filtering
+// with no time bound. Mirror pushes use this for a cheap diagnostics count
+// (Diagnostics.LocalSessionCount) without materializing every session.
+func (db *DB) CountSessionsForMirrorScope(
+	ctx context.Context, projects, excludeProjects []string,
+) (int, error) {
+	query := "SELECT COUNT(*) FROM sessions"
+	var (
+		args  []any
+		where []string
+	)
+	if len(projects) > 0 {
+		placeholders := make([]string, len(projects))
+		for i, p := range projects {
+			placeholders[i] = "?"
+			args = append(args, p)
+		}
+		where = append(where, "project IN ("+strings.Join(placeholders, ", ")+")")
+	}
+	if len(excludeProjects) > 0 {
+		placeholders := make([]string, len(excludeProjects))
+		for i, p := range excludeProjects {
+			placeholders[i] = "?"
+			args = append(args, p)
+		}
+		where = append(where, "project NOT IN ("+strings.Join(placeholders, ", ")+")")
+	}
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	var count int
+	if err := db.getReader().QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
+		return 0, fmt.Errorf("counting sessions for mirror scope: %w", err)
+	}
+	return count, nil
+}
+
+// normalizeMirrorWindowBound parses an RFC3339Nano timestamp and formats it
+// as ms-precision UTC text matching the sync_marker column format, so the
+// bound compares correctly against trigger-maintained markers.
+func normalizeMirrorWindowBound(bound string) (string, error) {
+	parsed, err := time.Parse(time.RFC3339Nano, bound)
+	if err != nil {
+		return "", fmt.Errorf("parsing mirror window bound %q: %w", bound, err)
+	}
+	return parsed.UTC().Format("2006-01-02T15:04:05.000Z"), nil
 }
 
 // SessionProjectsByIDs returns each session's current project keyed by session

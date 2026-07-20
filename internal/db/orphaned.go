@@ -557,26 +557,36 @@ func (d *DB) CopySessionMetadataFrom(
 		}
 	}
 
+	// database_id identifies the new physical generation and is never
+	// copied: every mirror push keys its incremental cursors to it, so the
+	// first push after a resync always full-rebuilds. That rebuild also
+	// makes journal continuity across the swap worthless, which is why the
+	// publication-revision counters are not copied either — the fresh
+	// database's own trigger-maintained counters stand, and the fresh
+	// journal rows they stamp are only ever consumed relative to them.
 	if oldDBHasTable(ctx, tx, "archive_metadata") {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO main.archive_metadata (key, value, created_at, updated_at)
 			SELECT key, value, created_at, updated_at
 			FROM old_db.archive_metadata
-			WHERE key != 'database_id'
+			WHERE key NOT IN (
+				'database_id',
+				'project_identity_publication_revision',
+				'session_deletion_publication_revision'
+			)
 			ON CONFLICT(key) DO UPDATE SET
-				value = CASE
-					WHEN excluded.key = 'project_identity_publication_revision'
-					THEN CAST(max(
-						CAST(archive_metadata.value AS INTEGER),
-						CAST(excluded.value AS INTEGER)
-					) AS TEXT)
-					ELSE excluded.value
-				END,
+				value = excluded.value,
 				created_at = excluded.created_at,
 				updated_at = excluded.updated_at`); err != nil {
 			return fmt.Errorf("copying archive metadata: %w", err)
 		}
 	}
+
+	// The session_deletion_changes journal is deliberately NOT copied from
+	// the source: its only consumers (the DuckDB mirror and internal/db)
+	// full-rebuild after every resync because the database_id changed, so
+	// journal continuity across the swap has no consumer. The fresh
+	// database's journal starts over with its own counter.
 
 	if oldDBHasTable(ctx, tx, "project_identity_observations") {
 		identityColumn := func(name, fallback string) string {

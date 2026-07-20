@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -16,7 +17,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
-	duckdbsync "go.kenn.io/agentsview/internal/duckdb"
 	"go.kenn.io/agentsview/internal/postgres"
 )
 
@@ -269,7 +269,10 @@ func TestDuckDBPushRejectsIncludeAndExcludeProjects(t *testing.T) {
 		"projects and exclude_projects are mutually exclusive")
 }
 
-func TestDuckDBPushRejectsMissingQuackTokenAsBadRequest(t *testing.T) {
+// TestDuckDBPushRejectsRemoteURLAsBadRequest verifies the daemon-side push
+// route rejects a remote Quack URL as bad request: push writes the local
+// mirror only, so a configured [duckdb].url is never a valid push target.
+func TestDuckDBPushRejectsRemoteURLAsBadRequest(t *testing.T) {
 	s := testServer(t, 30)
 
 	_, err := s.humaDuckDBPush(context.Background(), &daemonPushInput{
@@ -285,40 +288,107 @@ func TestDuckDBPushRejectsMissingQuackTokenAsBadRequest(t *testing.T) {
 	var statusErr interface{ GetStatus() int }
 	require.ErrorAs(t, err, &statusErr)
 	assert.Equal(t, http.StatusBadRequest, statusErr.GetStatus())
-	assert.Contains(t, err.Error(), "duckdb quack token is required")
+	assert.Contains(t, err.Error(), "duckdb push writes the local mirror")
 }
 
-func TestDuckDBPushConfigRequestOverrideSkipsDaemonEnvResolution(t *testing.T) {
-	const envName = "AGENTSVIEW_TEST_MISSING_DUCKDB_PATH_25053"
+// TestDuckDBPushConfigPinsServerMirrorPath pins the daemon-side path
+// guard: the mirror path a push writes is always the server's own resolved
+// configuration. A request-supplied config may still carry non-path fields
+// (machine name), but a request naming a DIFFERENT path is rejected — an
+// authenticated API caller must not be able to aim the rebuild's atomic
+// file replacement at an arbitrary daemon-writable file such as the
+// primary sessions.db.
+func TestDuckDBPushConfigPinsServerMirrorPath(t *testing.T) {
+	serverPath := filepath.Join(t.TempDir(), "server.duckdb")
 	s := testServerWithConfig(config.Config{
-		DuckDB: config.DuckDBConfig{Path: missingEnvRef(t, envName)},
+		DuckDB: config.DuckDBConfig{Path: serverPath, MachineName: "daemon"},
 	})
-	req := daemonPushRequest{
-		DuckDB: &config.DuckDBConfig{
-			Path:        "/tmp/agentsview.duckdb",
-			MachineName: "workstation",
+
+	tests := []struct {
+		name        string
+		req         *config.DuckDBConfig
+		wantMachine string
+		wantErrHas  string
+	}{
+		{
+			name:        "nil request config uses server config",
+			req:         nil,
+			wantMachine: "daemon",
+		},
+		{
+			name:        "empty request path defers to server path",
+			req:         &config.DuckDBConfig{MachineName: "workstation"},
+			wantMachine: "workstation",
+		},
+		{
+			name: "equal path in unclean form is accepted",
+			req: &config.DuckDBConfig{
+				Path: filepath.Join(
+					filepath.Dir(serverPath), ".", filepath.Base(serverPath),
+				),
+				MachineName: "workstation",
+			},
+			wantMachine: "workstation",
+		},
+		{
+			name: "different path is rejected",
+			req: &config.DuckDBConfig{
+				Path:        filepath.Join(t.TempDir(), "sessions.db"),
+				MachineName: "workstation",
+			},
+			wantErrHas: "server-configured mirror path",
 		},
 	}
-
-	got, err := s.duckDBPushConfig(req)
-	require.NoError(t, err)
-	assert.Equal(t, "/tmp/agentsview.duckdb", got.Path)
-	assert.Equal(t, "workstation", got.MachineName)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := s.duckDBPushConfig(daemonPushRequest{DuckDB: tt.req})
+			if tt.wantErrHas != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErrHas)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, serverPath, got.Path,
+				"pushes must always write the server-resolved mirror path")
+			assert.Equal(t, tt.wantMachine, got.MachineName)
+		})
+	}
 }
 
-func TestDuckDBPushSyncOptionsDerivesRemoteTargetScope(t *testing.T) {
-	duckCfg := config.DuckDBConfig{
-		URL:   "quack:https://duck.example.test?token=secret",
-		Token: "other-secret",
+// TestDuckDBPushRejectsMismatchedMirrorPathAsBadRequest is the handler-level
+// twin of TestDuckDBPushConfigPinsServerMirrorPath: the route surfaces the
+// path mismatch as a 400 instead of writing anywhere.
+func TestDuckDBPushRejectsMismatchedMirrorPathAsBadRequest(t *testing.T) {
+	s := testServer(t, 30)
+	s.cfg.DuckDB = config.DuckDBConfig{
+		Path:        filepath.Join(t.TempDir(), "server.duckdb"),
+		MachineName: "daemon",
 	}
 
+	_, err := s.humaDuckDBPush(context.Background(), &daemonPushInput{
+		Body: daemonPushRequest{
+			DuckDB: &config.DuckDBConfig{
+				Path:        filepath.Join(t.TempDir(), "sessions.db"),
+				MachineName: "workstation",
+			},
+		},
+	})
+	require.Error(t, err)
+
+	var statusErr interface{ GetStatus() int }
+	require.ErrorAs(t, err, &statusErr)
+	assert.Equal(t, http.StatusBadRequest, statusErr.GetStatus())
+	assert.Contains(t, err.Error(), "server-configured mirror path")
+}
+
+func TestDuckDBPushSyncOptionsPassesThroughProjectFilters(t *testing.T) {
 	got := duckDBPushSyncOptions(daemonPushRequest{
-		Projects: []string{"alpha"},
-	}, duckCfg)
+		Projects:        []string{"alpha"},
+		ExcludeProjects: []string{"beta"},
+	})
 
 	assert.Equal(t, []string{"alpha"}, got.Projects)
-	assert.Equal(t, duckdbsync.SyncStateTargetForConfig(duckCfg), got.SyncStateTarget)
-	assert.NotContains(t, got.SyncStateTarget, "secret")
+	assert.Equal(t, []string{"beta"}, got.ExcludeProjects)
 }
 
 func TestSyncRemotesRouteIsStreaming(t *testing.T) {

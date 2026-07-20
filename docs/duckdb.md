@@ -51,6 +51,14 @@ With `--watch`, AgentsView performs one initial sync and DuckDB push, then keeps
 running until interrupted. Shutdown via `Ctrl+C` or `SIGTERM` cancels the
 watcher cleanly.
 
+`duckdb push` always writes the local mirror file at `[duckdb].path`; it never
+pushes to a remote Quack endpoint. If `[duckdb].url` or
+`AGENTSVIEW_DUCKDB_URL` is configured, push fails immediately with an error
+telling you to unset it for pushes and expose the mirror remotely with
+`agentsview duckdb quack serve` instead. `url` is read-side only, configuring
+`duckdb status` and `duckdb serve`; `token` and `allow_insecure` also
+configure `duckdb quack serve`.
+
 When `[duckdb].path` or `AGENTSVIEW_DUCKDB_PATH` is configured, all local
 DuckDB commands use that same mirror file by default, including
 `duckdb quack serve`. Use `duckdb quack serve --path ...` only when you want to
@@ -86,6 +94,11 @@ attaches only that authority form; URL-scheme forms such as
 `quack:http://HOST:PORT` are rejected at attach time, so AgentsView refuses them
 up front. A non-loopback client host requires `allow_insecure` (Quack speaks
 plain HTTP — put it behind TLS, a VPN, or an SSH tunnel first).
+
+`duckdb push` never targets a remote endpoint, even when `[duckdb].url` is
+set: run push on the machine where the mirror file lives, then use
+`duckdb quack serve` to expose that file to other machines, which read it
+through `duckdb status` or `duckdb serve` pointed at the Quack URL.
 
 `duckdb quack serve` flags:
 
@@ -124,7 +137,7 @@ projects = ["alpha", "beta"]
 | Field              | Default                         | Description                                                                                 |
 | ------------------ | ------------------------------- | ------------------------------------------------------------------------------------------- |
 | `path`             | `~/.agentsview/sessions.duckdb` | Local DuckDB mirror file                                                                    |
-| `url`              |                                 | Remote Quack endpoint for `duckdb push`, `duckdb status`, and `duckdb serve` (`quack:` URI) |
+| `url`              |                                 | Remote Quack endpoint for `duckdb status` and `duckdb serve` (`quack:` URI); read side only — `duckdb push` rejects it |
 | `token`            |                                 | Quack authentication token                                                                  |
 | `machine_name`     | OS hostname                     | Identifies the pushing machine                                                              |
 | `allow_insecure`   | `false`                         | Allow plain-HTTP Quack beyond loopback                                                      |
@@ -136,7 +149,7 @@ Environment variables override the config file:
 | Variable                    | Description                   |
 | --------------------------- | ----------------------------- |
 | `AGENTSVIEW_DUCKDB_PATH`    | Local DuckDB mirror file path |
-| `AGENTSVIEW_DUCKDB_URL`     | Remote Quack endpoint URL for push, status, and serve |
+| `AGENTSVIEW_DUCKDB_URL`     | Remote Quack endpoint URL for status and serve (read side only) |
 | `AGENTSVIEW_DUCKDB_TOKEN`   | Quack authentication token    |
 | `AGENTSVIEW_DUCKDB_MACHINE` | Machine name override         |
 
@@ -153,3 +166,72 @@ Environment variables override the config file:
   subcommands report a clear error on that platform. Everything SQLite-backed
   works normally. On all other platforms the DuckDB driver is linked into the
   standard binary (which grows it considerably — this is expected).
+- **The mirror is a disposable derived artifact** — `duckdb push` rebuilds it
+  from scratch (temp file, atomic swap) when the file is missing or damaged,
+  `--full` is passed, the mirror's schema version does not match the running
+  binary, the local SQLite data version has changed (for example after a
+  resync), the mirror was built from a different SQLite archive than the one
+  pushing now, or the project-filter scope has changed. Otherwise push
+  applies a bounded incremental update that replaces only changed sessions,
+  applies recorded deletions, and removes previously mirrored sessions whose
+  project has since moved out of the configured scope.
+- **The first push after a resync is always a full rebuild** — the mirror
+  records the `database_id` of the SQLite archive generation it was built
+  from, and a resync builds a fresh archive with a new `database_id`. A push
+  whose local archive id no longer matches the mirror's recorded id rebuilds
+  from scratch instead of applying an incremental update whose cutoff and
+  journal cursors describe a different archive's history. This parallels the
+  PostgreSQL push, whose sync cursors are scoped by `database_id` in the
+  same way.
+- **Scope changes rebuild the mirror** — `--projects` / `--exclude-projects`
+  (or the configured `projects` / `exclude_projects`) scope is a property of
+  the whole mirror file. Changing it rebuilds the mirror to contain exactly
+  the new scope; sessions that were in scope for an earlier push are no
+  longer preserved once they fall out of scope. With an unchanged scope, a
+  session whose own project reassignment moves it out of scope is removed
+  from the mirror by the next incremental push, including when it was
+  hard-deleted locally after the move.
+- **Generated artifacts live in a per-mirror work directory** — push and
+  serve keep everything they generate (rebuild temp files, the hardlink
+  aliases serve uses to reopen a replaced mirror) in a private directory
+  next to the mirror named `<mirror-path>.agentsview-work`. Stale-artifact
+  cleanup only ever deletes inside that directory, so your own files next
+  to the mirror are never touched, whatever they are named. The directory
+  is safe to delete whenever no `duckdb push`, `duckdb serve`, or
+  `duckdb quack serve` process is running; the next push or serve recreates
+  it as needed. The directory must be private: it is created
+  user-only-writable, and push/serve refuse a work directory that is a
+  symlink, owned by another user, or writable by group or other (delete or
+  `chmod go-w` it and retry).
+- **`duckdb serve` and `duckdb quack serve` never create or migrate the
+  mirror** — a missing or schema-incompatible file makes them exit with an
+  error to run `duckdb push --full`. Both detect when a later push replaces
+  the file and reopen automatically: `duckdb serve` keeps serving the old
+  data until a compatible replacement appears, while `duckdb quack serve`
+  stops serving during the switch and, if the replacement is incompatible,
+  stays down (retrying with backoff) until a good file shows up. Run pushes
+  before or between serve sessions when that timing matters.
+- **Serve holds the mirror read-only; pushes probe freely** — `duckdb
+  serve` and `duckdb quack serve` open the mirror with DuckDB's read-only
+  access mode, and read-only handles coexist across processes. A push can
+  therefore always inspect a served mirror; only DuckDB's exclusive WRITE
+  lock conflicts. While serve processes hold the file, an incremental
+  push cannot acquire write access: an explicit `duckdb push` falls back
+  to a full rebuild (temp file plus atomic rename, which never opens the
+  destination for writing), while the automatic pushes of `duckdb push
+  --watch` defer instead (logging the deferral) so a long-running serve
+  does not turn every changed batch into a full-archive rebuild. A
+  deferred push does not advance the mirror's push cutoff, so once the
+  serve process releases the file the next push catches up on everything
+  that changed in the meantime. A push that finds the mirror held
+  READ-WRITE fails with an error naming the holder: that is either
+  another push in flight or a serve process built before serve went
+  read-only — upgrading such a serve process needs a one-time restart.
+  Leftover `<mirror-path>.agentsview-mirror` sidecar files from older
+  development builds are inert and can be deleted. On POSIX platforms,
+  where rename is atomic even against an open destination handle, a
+  running serve process picks up a rebuilt file automatically (see the
+  reopen behavior above) without needing a restart. On Windows, the serve
+  process's open handle on the destination file can block the rename
+  outright; `duckdb push` retries briefly and then fails with an error
+  asking you to stop the serving process and re-run the push.

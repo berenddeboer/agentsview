@@ -31,10 +31,11 @@ var openCodeFamilySQLiteAgents = []parser.AgentType{
 	parser.AgentIcodemate,
 }
 
+var statSQLiteContainerState = parser.StatSQLiteContainerState
+
 // sqliteContainerSourceForFile maps a discovered file to its shared SQLite
-// container path and session ID, or ok=false when the file is not an
-// OpenCode-family SQLite virtual source (storage-mode JSON sessions
-// included).
+// container path and session ID, or ok=false when the file is not one of the
+// shared-SQLite sources that can gate-skip before fingerprinting.
 func sqliteContainerSourceForFile(
 	file parser.DiscoveredFile,
 ) (dbPath, sessionID string, ok bool) {
@@ -46,8 +47,8 @@ func sqliteContainerSourceForFile(
 }
 
 // sqliteContainerPathForResultPath maps a processed result path back to its
-// container. Result paths arrive without an agent, so every family DB name
-// is tried.
+// container. Result paths arrive without an agent, so every family DB name is
+// tried.
 func sqliteContainerPathForResultPath(path string) string {
 	for _, agent := range openCodeFamilySQLiteAgents {
 		dbPath, _, ok := parser.ParseVirtualSourcePathForBase(
@@ -94,26 +95,68 @@ type sqliteContainerPass struct {
 // and a later capture would be promoted away and gate-skipped without ever
 // being parsed. Containers whose state cannot be read are simply absent
 // from the map and never promoted.
-func (e *Engine) captureSQLiteContainerStates() map[string]parser.SQLiteContainerState {
+func (e *Engine) captureSQLiteContainerStates(
+	changedPaths []string,
+) map[string]parser.SQLiteContainerState {
 	if e.forceParse {
 		return nil
 	}
 	states := make(map[string]parser.SQLiteContainerState)
-	for _, agent := range openCodeFamilySQLiteAgents {
-		for _, dir := range e.agentDirs[agent] {
-			if dir == "" || strings.HasPrefix(dir, "s3://") {
-				continue
+	addState := func(agent parser.AgentType, dbPath string) {
+		if dbPath == "" {
+			return
+		}
+		if _, seen := states[dbPath]; seen {
+			return
+		}
+		state, ok := statSQLiteContainerState(dbPath)
+		if !ok {
+			return
+		}
+		states[dbPath] = state
+	}
+	if len(changedPaths) == 0 {
+		for _, agent := range openCodeFamilySQLiteAgents {
+			for _, dir := range e.agentDirs[agent] {
+				if dir == "" || strings.HasPrefix(dir, "s3://") {
+					continue
+				}
+				src := resolveOpenCodeFormatSource(agent, filepath.Clean(dir))
+				addState(agent, src.DBPath)
 			}
-			src := resolveOpenCodeFormatSource(agent, filepath.Clean(dir))
-			if src.DBPath == "" {
-				continue
-			}
-			if state, ok := parser.StatSQLiteContainerState(src.DBPath); ok {
-				states[src.DBPath] = state
+		}
+		return states
+	}
+	for _, rawPath := range changedPaths {
+		path := filepath.Clean(rawPath)
+		for _, agent := range openCodeFamilySQLiteAgents {
+			for _, dir := range e.agentDirs[agent] {
+				if dir == "" || strings.HasPrefix(dir, "s3://") {
+					continue
+				}
+				addState(agent, openCodeContainerPathForEvent(agent, dir, path))
 			}
 		}
 	}
 	return states
+}
+
+func openCodeContainerPathForEvent(
+	agent parser.AgentType,
+	root string,
+	path string,
+) string {
+	src := resolveOpenCodeFormatSource(agent, filepath.Clean(root))
+	if src.DBPath == "" {
+		return ""
+	}
+	path = filepath.Clean(path)
+	if path == src.DBPath ||
+		path == src.DBPath+"-wal" ||
+		path == src.DBPath+"-shm" {
+		return src.DBPath
+	}
+	return ""
 }
 
 // beginSQLiteContainerPass starts a pass's gate bookkeeping from the
@@ -172,7 +215,7 @@ func (e *Engine) beginSQLiteContainerPass(
 	}
 	if pass != nil {
 		for dbPath, pre := range pass.captured {
-			if post, ok := parser.StatSQLiteContainerState(dbPath); ok &&
+			if post, ok := statSQLiteContainerState(dbPath); ok &&
 				post == pre {
 				continue
 			}

@@ -65,6 +65,10 @@ type multiSessionConfig struct {
 	// fingerprint returns the source freshness fingerprint (Size/MTime/Hash);
 	// the base supplies the Key.
 	fingerprint func(src multiSessionSource) (SourceFingerprint, error)
+	// parseContainerOutcome optionally builds the full container outcome
+	// directly, for providers that need container-level completeness or
+	// no-session semantics beyond a flat []ParseResult.
+	parseContainerOutcome func(src multiSessionSource, req ParseRequest) (ParseOutcome, error)
 	// parseContainer parses every member of a container into one result each.
 	// The full ParseRequest is passed so a closure can read req.Machine and
 	// per-request hints such as req.Source.ProjectHint.
@@ -74,6 +78,10 @@ type multiSessionConfig struct {
 	// memberPresent reports whether a source still exists for RequireFreshSource
 	// lookups. Optional; the default treats every source as present.
 	memberPresent func(src multiSessionSource) bool
+	// batchMemberPresence reports current membership for the stored members of one
+	// changed container during a single tombstone pass. Optional; when nil the
+	// base falls back to calling memberPresent per member.
+	batchMemberPresence func(container multiSessionSource, members []multiSessionSource) map[string]bool
 	// freshStoredMember reports whether a stored member source still resolves to
 	// the requested raw session ID under RequireFreshSource. Providers with
 	// positional member IDs (Aider's run index) set this so a stored path whose
@@ -151,6 +159,12 @@ func WithContainerParse(
 	return func(c *multiSessionConfig) { c.parseContainer = fn }
 }
 
+func WithContainerParseOutcome(
+	fn func(src multiSessionSource, req ParseRequest) (ParseOutcome, error),
+) MultiSessionOption {
+	return func(c *multiSessionConfig) { c.parseContainerOutcome = fn }
+}
+
 func WithMemberParse(
 	fn func(src multiSessionSource, req ParseRequest) (*ParseResult, error),
 ) MultiSessionOption {
@@ -159,6 +173,12 @@ func WithMemberParse(
 
 func WithMemberPresence(fn func(src multiSessionSource) bool) MultiSessionOption {
 	return func(c *multiSessionConfig) { c.memberPresent = fn }
+}
+
+func WithBatchMemberPresence(
+	fn func(container multiSessionSource, members []multiSessionSource) map[string]bool,
+) MultiSessionOption {
+	return func(c *multiSessionConfig) { c.batchMemberPresence = fn }
 }
 
 func WithFreshStoredMember(
@@ -191,8 +211,8 @@ func NewMultiSessionContainerSourceSet(
 		panic("multi-session container: missing WithMemberLookup")
 	case cfg.fingerprint == nil:
 		panic("multi-session container: missing WithFingerprint")
-	case cfg.parseContainer == nil:
-		panic("multi-session container: missing WithContainerParse")
+	case cfg.parseContainer == nil && cfg.parseContainerOutcome == nil:
+		panic("multi-session container: missing WithContainerParse or WithContainerParseOutcome")
 	case cfg.parseMember == nil:
 		panic("multi-session container: missing WithMemberParse")
 	}
@@ -242,6 +262,10 @@ func (s multiSessionContainerSourceSet) discoverMatches(
 	out := make([]multiSessionMatch, 0, len(containers))
 	for _, container := range containers {
 		if container == "" {
+			continue
+		}
+		if match, ok := s.cfg.classifyPath(root, container, false); ok {
+			out = append(out, match)
 			continue
 		}
 		out = append(out, multiSessionMatch{Path: container, Container: container})
@@ -300,6 +324,7 @@ func (s multiSessionContainerSourceSet) changedPathTombstones(
 	containerExists := IsRegularFile(changed.Container)
 	var tombstones []SourceRef
 	seen := make(map[string]struct{})
+	var members []multiSessionMatch
 	for _, stored := range storedPaths {
 		match, ok := s.cfg.classifyPath(root, stored, true)
 		if !ok || match.MemberID == "" {
@@ -321,7 +346,18 @@ func (s multiSessionContainerSourceSet) changedPathTombstones(
 				tombstones = append(tombstones, s.sourceRef(root, current))
 				continue
 			}
-		} else if s.memberPresent(match.toSource(root)) {
+			if _, dup := seen[match.Path]; dup {
+				continue
+			}
+			seen[match.Path] = struct{}{}
+			tombstones = append(tombstones, s.sourceRef(root, match))
+			continue
+		}
+		members = append(members, match)
+	}
+	present := s.batchMemberPresence(changed.toSource(root), members)
+	for _, match := range members {
+		if s.memberPresentForTombstone(match.toSource(root), present) {
 			continue
 		}
 		if _, dup := seen[match.Path]; dup {
@@ -331,6 +367,32 @@ func (s multiSessionContainerSourceSet) changedPathTombstones(
 		tombstones = append(tombstones, s.sourceRef(root, match))
 	}
 	return tombstones
+}
+
+func (s multiSessionContainerSourceSet) batchMemberPresence(
+	container multiSessionSource,
+	members []multiSessionMatch,
+) map[string]bool {
+	if s.cfg.batchMemberPresence == nil || len(members) == 0 {
+		return nil
+	}
+	batch := make([]multiSessionSource, 0, len(members))
+	for _, member := range members {
+		batch = append(batch, member.toSource(container.Root))
+	}
+	return s.cfg.batchMemberPresence(container, batch)
+}
+
+func (s multiSessionContainerSourceSet) memberPresentForTombstone(
+	src multiSessionSource,
+	present map[string]bool,
+) bool {
+	if present != nil {
+		if ok, found := present[src.Path]; found {
+			return ok
+		}
+	}
+	return s.memberPresent(src)
 }
 
 func multiSessionMatchOwnsContainer(
@@ -438,6 +500,19 @@ func (s multiSessionContainerSourceSet) parse(
 			ResultSetComplete: true,
 			ForceReplace:      true,
 		}, nil
+	}
+
+	if s.cfg.parseContainerOutcome != nil {
+		outcome, err := s.cfg.parseContainerOutcome(src, req)
+		if err != nil {
+			return ParseOutcome{}, err
+		}
+		if fingerprintHash != "" && s.cfg.stampContainerHash {
+			for i := range outcome.Results {
+				outcome.Results[i].Result.Session.File.Hash = fingerprintHash
+			}
+		}
+		return outcome, nil
 	}
 
 	results, err := s.cfg.parseContainer(src, req)

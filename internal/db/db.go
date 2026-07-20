@@ -1979,6 +1979,10 @@ func schemaColumnMigrations() []schemaColumnMigration {
 			"project_identity_observations", "remote_candidate_count",
 			"ALTER TABLE project_identity_observations ADD COLUMN remote_candidate_count INTEGER NOT NULL DEFAULT 0",
 		},
+		{
+			"sessions", "sync_marker",
+			"ALTER TABLE sessions ADD COLUMN sync_marker TEXT",
+		},
 	}
 }
 
@@ -2079,6 +2083,9 @@ func (db *DB) migrateColumns() error {
 	defer db.mu.Unlock()
 	w := db.getWriter()
 	if err := applySchemaColumnMigrations(w.QueryRow, w.Exec); err != nil {
+		return err
+	}
+	if err := installSyncMarkerSchemaLocked(w); err != nil {
 		return err
 	}
 	if err := db.createPartialIndexesLocked(w); err != nil {
@@ -2240,6 +2247,138 @@ func (db *DB) migrateColumns() error {
 	}
 	if err := db.markTokenCoverageRepairDoneLocked(w); err != nil {
 		return err
+	}
+	return nil
+}
+
+// syncMarkerSchemaSQL creates the sync_marker index and the triggers that
+// keep it equal to the max of created_at, local_modified_at, ended_at,
+// started_at, and file_mtime, normalized to ms-precision UTC text. This is
+// the SQL twin of the max-of-signals sync marker computation; the
+// PostgreSQL push computes the same value in Go (see internal/postgres).
+// MAX(a,b,...) returns NULL if any argument is NULL, hence the COALESCEs.
+// Every signal, including created_at, falls back to the empty string when
+// missing or unparseable — there is deliberately NO raw-string fallback for
+// created_at: the raw value would participate in MAX, and because letters
+// sort above digits a malformed created_at like "not-a-timestamp" would
+// permanently beat every normalized "2026-..." timestamp, become the
+// session's marker, advance the push cutoff, and exclude all future real
+// changes from the incremental window. The Go computation drops an
+// unparseable CreatedAt from its max the same way. A session whose ONLY
+// signal is a malformed created_at therefore gets marker ” and is
+// invisible to incremental windows, matching the PG push's window
+// semantics; a full rebuild still covers it.
+// AFTER UPDATE OF only fires on the five source columns, and the trigger
+// body writes only sync_marker, so it cannot recurse.
+//
+// This lives here rather than in schema.sql because schema.sql runs
+// unconditionally on every Open() (via db.init) before
+// applySchemaColumnMigrations has a chance to add sync_marker to a
+// pre-existing sessions table, and a trigger body referencing a column that
+// doesn't exist yet fails to create. Running it here, right after the
+// column migration, guarantees the column is present first.
+//
+// The unconditional DROP followed by CREATE IF NOT EXISTS mirrors the
+// project-identity journal triggers in schema.sql: the DROP propagates
+// trigger-body updates on the next Open, while IF NOT EXISTS keeps two
+// concurrent Opens from colliding when both pass the DROP before either
+// CREATE runs (see TestMigrationRace).
+const syncMarkerSchemaSQL = `
+CREATE INDEX IF NOT EXISTS idx_sessions_sync_marker ON sessions(sync_marker);
+
+DROP TRIGGER IF EXISTS trg_sessions_sync_marker_insert;
+CREATE TRIGGER IF NOT EXISTS trg_sessions_sync_marker_insert
+AFTER INSERT ON sessions
+BEGIN
+    UPDATE sessions SET sync_marker = MAX(
+        COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at), ''),
+        COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', NULLIF(NEW.local_modified_at, '')), ''),
+        COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', NULLIF(NEW.ended_at, '')), ''),
+        COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', NULLIF(NEW.started_at, '')), ''),
+        COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', NEW.file_mtime / 1000000000.0, 'unixepoch'), '')
+    ) WHERE id = NEW.id;
+END;
+
+DROP TRIGGER IF EXISTS trg_sessions_sync_marker_update;
+CREATE TRIGGER IF NOT EXISTS trg_sessions_sync_marker_update
+AFTER UPDATE OF created_at, local_modified_at, ended_at, started_at, file_mtime ON sessions
+BEGIN
+    UPDATE sessions SET sync_marker = MAX(
+        COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at), ''),
+        COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', NULLIF(NEW.local_modified_at, '')), ''),
+        COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', NULLIF(NEW.ended_at, '')), ''),
+        COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', NULLIF(NEW.started_at, '')), ''),
+        COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', NEW.file_mtime / 1000000000.0, 'unixepoch'), '')
+    ) WHERE id = NEW.id;
+END;
+`
+
+// backfillSyncMarkerSQL computes sync_marker for rows written before
+// the column existed. It is the SQL twin of the trigger bodies above:
+// the max of created_at, local_modified_at, ended_at, started_at, and
+// file_mtime, normalized to ms-precision UTC text; both the PostgreSQL and
+// DuckDB pushes select their candidates against it (see
+// ListSessionsForMirrorWindow).
+// Every field, including created_at, falls back to the empty string
+// when missing or unparseable; see syncMarkerSchemaSQL for why created_at
+// must not fall back to its raw value (a malformed string would poison the
+// MAX and permanently advance the push cutoff past every real timestamp).
+// The WHERE clause makes it idempotent and cheap once every row has a
+// marker.
+const backfillSyncMarkerSQL = `UPDATE sessions SET sync_marker = MAX(
+    COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', created_at), ''),
+    COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', NULLIF(local_modified_at, '')), ''),
+    COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', NULLIF(ended_at, '')), ''),
+    COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', NULLIF(started_at, '')), ''),
+    COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', file_mtime / 1000000000.0, 'unixepoch'), '')
+) WHERE sync_marker IS NULL`
+
+// installSyncMarkerSchemaLocked applies syncMarkerSchemaSQL and the
+// sync_marker backfill in ONE write transaction. The DROP/CREATE trigger
+// pairs must not be split across transactions: with a trigger absent,
+// another handle on the same archive (a CLI command racing the daemon's
+// startup, or a second concurrent Open) could update a session without
+// refreshing sync_marker, leaving a stale marker that permanently hides
+// the change from incremental mirror windows. The backfill rides in the
+// same transaction so no writer can observe triggers without markers.
+// Safe to run on every startup: the CREATE IF NOT EXISTS statements and
+// the backfill's WHERE sync_marker IS NULL clause make it a no-op once
+// the archive is caught up.
+func installSyncMarkerSchemaLocked(w *writerHandle) error {
+	tx, err := w.BeginTx(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("beginning sync_marker schema transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(syncMarkerSchemaSQL); err != nil {
+		return fmt.Errorf("creating sync_marker index and triggers: %w", err)
+	}
+	if _, err := tx.Exec(backfillSyncMarkerSQL); err != nil {
+		return fmt.Errorf("backfilling sync_marker: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing sync_marker schema: %w", err)
+	}
+	return nil
+}
+
+// execSchemaScriptLocked applies schema.sql inside one write transaction.
+// The script drops and recreates the deletion-journal and identity-journal
+// triggers to propagate trigger-body updates on upgrade; without a
+// transaction, another process's session delete could land in the window
+// where a trigger is absent, skipping the journal row that incremental
+// mirror consumers (PG tombstones, the DuckDB deletion delta) rely on.
+func execSchemaScriptLocked(w *writerHandle) error {
+	tx, err := w.BeginTx(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("beginning schema script transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(schemaSQL); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing schema script: %w", err)
 	}
 	return nil
 }
@@ -2839,10 +2978,17 @@ func (db *DB) applySessionCoverageUpdates(
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// local_modified_at is bumped so the sync_marker trigger fires and push
+	// targets (PostgreSQL and the DuckDB mirror) re-select the repaired
+	// sessions: both has_* columns are mirrored, but neither is a
+	// sync_marker signal, so this one-time repair would otherwise leave
+	// already-pushed rows stale until an unrelated change re-selected them
+	// (see updateSessionSignalsTx for the same pattern).
 	stmt, err := tx.Prepare(
 		`UPDATE sessions
 		 SET has_total_output_tokens = ?,
-		     has_peak_context_tokens = ?
+		     has_peak_context_tokens = ?,
+		     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		 WHERE id = ?`,
 	)
 	if err != nil {
@@ -3160,7 +3306,7 @@ func (db *DB) init() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	w := db.getWriter()
-	if _, err := w.Exec(schemaSQL); err != nil {
+	if err := execSchemaScriptLocked(w); err != nil {
 		return err
 	}
 
@@ -3462,6 +3608,24 @@ func (db *DB) SetSyncState(key, value string) error {
 		 VALUES (?, ?)
 		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
 		key, value,
+	)
+	return err
+}
+
+// DeleteSyncStateByPrefix removes every pg_sync_state row whose key starts
+// with prefix. Used to clean up state left behind by superseded sync
+// designs (e.g. the pre-schema-v3 DuckDB push watermarks, now tracked in
+// the mirror's own sync_metadata table instead of local pg_sync_state).
+// prefix is escaped so LIKE metacharacters in it (%, _) match literally.
+func (db *DB) DeleteSyncStateByPrefix(prefix string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	escaped := strings.NewReplacer(
+		"\\", "\\\\", "%", "\\%", "_", "\\_",
+	).Replace(prefix)
+	_, err := db.getWriter().Exec(
+		"DELETE FROM pg_sync_state WHERE key LIKE ? ESCAPE '\\'",
+		escaped+"%",
 	)
 	return err
 }

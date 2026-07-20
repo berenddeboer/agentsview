@@ -21,6 +21,7 @@
   import { copyToClipboard } from "../../utils/clipboard.js";
   import { stripIdPrefix } from "../../utils/resume.js";
   import { normalizeMessagePreview } from "../../utils/messages.js";
+  import SemanticSetupHelp from "./SemanticSetupHelp.svelte";
   import type { Session } from "../../api/types.js";
   import type {
     PaletteSearchResult,
@@ -86,6 +87,17 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
+    const interactiveTarget =
+      e.target !== inputRef &&
+      e.target instanceof Element &&
+      e.target.closest(
+        "button, a[href], input, select, textarea, [contenteditable='true'], " +
+          "[role='button'], [role='checkbox'], [role='combobox'], " +
+          // kit-ui-check-ignore: selector list for interactive event targets, not toggle markup
+          "[role='menuitem'], [role='radio'], [role='switch'], [role='tab']",
+      );
+    if (e.key !== "Escape" && interactiveTarget) return;
+
     if (e.key === "ArrowDown") {
       e.preventDefault();
       selectedIndex = Math.min(selectedIndex + 1, totalItems - 1);
@@ -97,6 +109,7 @@
       selectCurrent();
     } else if (e.key === "Escape") {
       e.preventDefault();
+      e.stopPropagation();
       close();
     }
   }
@@ -254,6 +267,11 @@
       {#if showSearchResults}
         {#if searchStore.isSearching}
           <div class="palette-empty">{m.command_palette_searching()}</div>
+        {:else if searchStore.error?.kind === "semantic-unavailable"}
+          <SemanticSetupHelp
+            onResolved={() => searchStore.retry()}
+            searchDetail={searchStore.error.detail}
+          />
         {:else if searchStore.error}
           <div class="palette-error" role="alert">
             {#if searchStore.error.kind === "timeout"}

@@ -2,24 +2,25 @@ package duckdb
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	neturl "net/url"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
 
 	"go.kenn.io/agentsview/internal/config"
-	"go.kenn.io/agentsview/internal/db"
 )
 
 const quackAttachmentName = "agentsview_remote"
 
-// Open opens a local DuckDB file for the agentsview mirror backend.
+// Open opens a local DuckDB file read-write for the agentsview mirror
+// backend. Only push paths use it: DuckDB's write lock is exclusive across
+// processes, so a read-write handle blocks every other open on the file.
+// Serve and probe paths use OpenReadOnly instead.
 func Open(path string) (*sql.DB, error) {
 	if path == "" {
 		return nil, fmt.Errorf("duckdb path is required")
@@ -28,9 +29,29 @@ func Open(path string) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening duckdb file: %w", err)
 	}
-	// DuckDB permits one writer per database file. Keeping a single
-	// pooled connection avoids surprising file-lock contention while
-	// the mirror sync path is still process-local.
+	return configureOpenedDuckDB(db)
+}
+
+// OpenReadOnly opens an existing local DuckDB file read-only. Read-only
+// handles coexist across processes (and, for the same literal DSN, share one
+// in-process instance), so serve processes and probes never take DuckDB's
+// exclusive write lock on the mirror and never create a missing file.
+func OpenReadOnly(path string) (*sql.DB, error) {
+	if path == "" {
+		return nil, fmt.Errorf("duckdb path is required")
+	}
+	db, err := openDuckDB(path + "?access_mode=read_only")
+	if err != nil {
+		return nil, fmt.Errorf("opening duckdb file %s read-only: %w", path, err)
+	}
+	return configureOpenedDuckDB(db)
+}
+
+// configureOpenedDuckDB applies the shared connection settings: a single
+// pooled connection (DuckDB permits one writer per database file, and a
+// single connection avoids surprising file-lock contention) and the thread
+// count.
+func configureOpenedDuckDB(db *sql.DB) (*sql.DB, error) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	if err := configureDuckDBThreads(db); err != nil {
@@ -38,62 +59,6 @@ func Open(path string) (*sql.DB, error) {
 		return nil, err
 	}
 	return db, nil
-}
-
-// ReadLastPushAt reads the local DuckDB push watermark for the optional
-// PG-compatible target scope.
-func ReadLastPushAt(local *db.DB, syncStateTarget string) (string, error) {
-	if local == nil {
-		return "", fmt.Errorf("local sync state is required")
-	}
-	return local.GetSyncState(
-		scopedDuckDBSyncStateKey(lastPushStateKey, syncStateTarget),
-	)
-}
-
-// SyncStateTargetForConfig returns the local sync-state scope for a DuckDB
-// target. Local file mirrors keep the historical unscoped watermark; remote
-// Quack targets get a non-secret URL fingerprint so distinct remotes cannot
-// reuse each other's push watermark.
-func SyncStateTargetForConfig(cfg config.DuckDBConfig) string {
-	if strings.TrimSpace(cfg.URL) == "" {
-		return ""
-	}
-	sum := sha256.Sum256([]byte(canonicalDuckDBSyncTarget(cfg.URL)))
-	encoded := hex.EncodeToString(sum[:])
-	return "url-" + encoded[:16]
-}
-
-func canonicalDuckDBSyncTarget(rawURL string) string {
-	rawURL = strings.TrimSpace(rawURL)
-	if rawURL == "" {
-		return ""
-	}
-	if !strings.HasPrefix(rawURL, "quack:") {
-		return rawURL
-	}
-	transport := strings.TrimPrefix(rawURL, "quack:")
-	if strings.HasPrefix(transport, "http://") ||
-		strings.HasPrefix(transport, "https://") {
-		if u, err := neturl.Parse(transport); err == nil {
-			u.User = nil
-			q := u.Query()
-			for key := range q {
-				if isSecretURLQueryKey(key) {
-					q.Del(key)
-				}
-			}
-			u.RawQuery = q.Encode()
-			u.Fragment = ""
-			return "quack:" + u.String()
-		}
-	}
-	transport = strings.SplitN(transport, "#", 2)[0]
-	transport = strings.SplitN(transport, "?", 2)[0]
-	if at := strings.LastIndex(transport, "@"); at >= 0 {
-		transport = transport[at+1:]
-	}
-	return "quack:" + transport
 }
 
 func isSecretURLQueryKey(key string) bool {
@@ -117,15 +82,20 @@ func isCredentialQueryKey(key, credential string) bool {
 	return false
 }
 
-// ReadStatusFromConfig reads DuckDB/Quack row counts without requiring a local
-// Sync handle. Callers pass any local last-push watermark they want displayed.
+// ReadStatusFromConfig reads DuckDB/Quack push metadata and row counts
+// without requiring a local Sync handle. It reports the TARGET's own
+// sync_metadata (last push time/machine, schema/data version, scope) rather
+// than any locally tracked watermark, so it works identically for a local
+// mirror file and a remote Quack endpoint.
 func ReadStatusFromConfig(
 	ctx context.Context,
 	cfg config.DuckDBConfig,
-	lastPush string,
 ) (SyncStatus, error) {
 	if cfg.MachineName == "" {
 		return SyncStatus{}, fmt.Errorf("machine name must not be empty")
+	}
+	if cfg.URL == "" {
+		return readLocalMirrorStatus(ctx, cfg)
 	}
 	store, err := NewStoreFromConfig(cfg)
 	if err != nil {
@@ -133,23 +103,76 @@ func ReadStatusFromConfig(
 	}
 	defer store.Close()
 	return readMachineStatus(
-		ctx, store.DB(), store.connectionKind, store.quack,
-		cfg.MachineName, lastPush,
+		ctx, store.DB(), store.connectionKind, store.quack, cfg.MachineName,
 	)
 }
 
+// readLocalMirrorStatus reads status from a local mirror file without ever
+// creating it. A missing file reports SyncStatus.MirrorMissing; an existing
+// file is opened with OpenReadOnly, which can never create or write.
+func readLocalMirrorStatus(
+	ctx context.Context, cfg config.DuckDBConfig,
+) (SyncStatus, error) {
+	if cfg.Path == "" {
+		return SyncStatus{}, fmt.Errorf("duckdb path is required")
+	}
+	if _, err := os.Stat(cfg.Path); os.IsNotExist(err) {
+		return SyncStatus{Machine: cfg.MachineName, MirrorMissing: true}, nil
+	} else if err != nil {
+		return SyncStatus{}, fmt.Errorf(
+			"statting duckdb mirror %s: %w", cfg.Path, err,
+		)
+	}
+	conn, err := OpenReadOnly(cfg.Path)
+	if err != nil {
+		return SyncStatus{}, err
+	}
+	defer func() { _ = conn.Close() }()
+	return readMachineStatus(
+		ctx, conn, duckDBBaseConnection, nil, cfg.MachineName,
+	)
+}
+
+// readMachineStatus reads the target's push metadata and machine-scoped row
+// counts. It tolerates a mirror with no sync_metadata rows yet, or missing
+// tables entirely (a fresh, foreign, or pre-v3 file): both degrade to zero
+// values instead of erroring, since status must not crash on an old mirror.
+//
+// The row counts are filtered by the TARGET's own recorded LastPushMachine
+// when it is set, not by the caller's configured machine name: a remote
+// Quack client's configured machine name is normally its own hostname,
+// which almost never matches the hostname of whatever machine actually
+// pushed the mirror it is reading, so filtering by the configured name
+// there would report zero rows even though the display line above already
+// shows a real LastPushMachine and non-zero mirror content. The configured
+// machine name is used only as the fallback for a mirror with no recorded
+// push yet (LastPushMachine == ""), where it is the best available guess.
 func readMachineStatus(
 	ctx context.Context,
 	duck *sql.DB,
 	connectionKind duckDBConnectionKind,
 	quack *quackClient,
 	machine string,
-	lastPush string,
 ) (SyncStatus, error) {
-	status := SyncStatus{Machine: machine, LastPushAt: lastPush}
+	status := SyncStatus{Machine: machine}
+	meta, err := readTargetMirrorStatusMetadata(ctx, duck, connectionKind, quack)
+	if err != nil {
+		return SyncStatus{}, err
+	}
+	status.LastPushAt = meta.LastPushAt
+	status.LastPushMachine = meta.LastPushMachine
+	status.SchemaVersion = meta.SchemaVersion
+	status.DataVersion = meta.DataVersion
+	status.Scope = meta.Scope
+
+	countMachine := meta.LastPushMachine
+	if countMachine == "" {
+		countMachine = machine
+	}
+
 	if err := queryDuckDBRowContext(ctx, duck, connectionKind, quack,
 		`SELECT COUNT(*) FROM sessions WHERE machine = ?`,
-		machine,
+		countMachine,
 	).Scan(&status.DuckDBSessions); err != nil {
 		if isMissingDuckDBTable(err) {
 			return status, nil
@@ -162,7 +185,7 @@ func readMachineStatus(
 		 WHERE session_id IN (
 			SELECT id FROM sessions WHERE machine = ?
 		 )`,
-		machine,
+		countMachine,
 	).Scan(&status.DuckDBMessages); err != nil {
 		if isMissingDuckDBTable(err) {
 			return status, nil
@@ -170,6 +193,73 @@ func readMachineStatus(
 		return SyncStatus{}, fmt.Errorf("counting duckdb messages: %w", err)
 	}
 	return status, nil
+}
+
+// targetMirrorStatusMetadata is the subset of mirror push metadata that
+// duckdb status reports, read from whatever mirror the caller is connected
+// to (local file or remote Quack endpoint) via queryDuckDBContext so the
+// query literalizes correctly over Quack's query() table function.
+type targetMirrorStatusMetadata struct {
+	SchemaVersion   int
+	DataVersion     int
+	Scope           string
+	LastPushAt      string
+	LastPushMachine string
+}
+
+func readTargetMirrorStatusMetadata(
+	ctx context.Context,
+	duck *sql.DB,
+	connectionKind duckDBConnectionKind,
+	quack *quackClient,
+) (targetMirrorStatusMetadata, error) {
+	rows, err := queryDuckDBContext(ctx, duck, connectionKind, quack,
+		`SELECT key, value FROM sync_metadata WHERE key IN (?, ?, ?, ?, ?)`,
+		schemaVersionMetadataKey, dataVersionMetadataKey, pushScopeMetadataKey,
+		lastPushAtMetadataKey, lastPushMachineMetadataKey,
+	)
+	if err != nil {
+		if isMissingDuckDBTable(err) {
+			return targetMirrorStatusMetadata{}, nil
+		}
+		return targetMirrorStatusMetadata{}, fmt.Errorf(
+			"reading duckdb mirror push metadata: %w", err,
+		)
+	}
+	defer rows.Close()
+
+	raw := make(map[string]string, 5)
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			return targetMirrorStatusMetadata{}, fmt.Errorf(
+				"scanning duckdb mirror push metadata: %w", err,
+			)
+		}
+		raw[key] = value
+	}
+	if err := rows.Err(); err != nil {
+		return targetMirrorStatusMetadata{}, fmt.Errorf(
+			"iterating duckdb mirror push metadata: %w", err,
+		)
+	}
+
+	meta := targetMirrorStatusMetadata{
+		Scope:           raw[pushScopeMetadataKey],
+		LastPushAt:      raw[lastPushAtMetadataKey],
+		LastPushMachine: raw[lastPushMachineMetadataKey],
+	}
+	if meta.SchemaVersion, err = parseMirrorMetadataInt(
+		schemaVersionMetadataKey, raw[schemaVersionMetadataKey],
+	); err != nil {
+		return targetMirrorStatusMetadata{}, err
+	}
+	if meta.DataVersion, err = parseMirrorMetadataInt(
+		dataVersionMetadataKey, raw[dataVersionMetadataKey],
+	); err != nil {
+		return targetMirrorStatusMetadata{}, err
+	}
+	return meta, nil
 }
 
 func isMissingDuckDBTable(err error) bool {
@@ -191,61 +281,16 @@ func NewStoreFromConfig(cfg config.DuckDBConfig) (*Store, error) {
 	return NewStore(cfg.Path)
 }
 
-// ValidatePushTarget validates remote DuckDB push targets without opening a
-// DuckDB connection. Local file targets are validated when opened.
+// ValidatePushTarget rejects remote push targets. The mirror is written
+// locally; expose it read-only with `agentsview duckdb quack serve`.
 func ValidatePushTarget(cfg config.DuckDBConfig) error {
-	if cfg.URL == "" {
-		return nil
-	}
-	return ValidateQuackClientURL(cfg.URL, cfg.Token, cfg.AllowInsecure)
-}
-
-// NewFromConfig opens either a local DuckDB mirror file or a remote Quack
-// endpoint for push sync.
-func NewFromConfig(
-	cfg config.DuckDBConfig, local *db.DB, opts SyncOptions,
-) (*Sync, error) {
-	if err := validateSyncInputs(local, cfg.MachineName); err != nil {
-		return nil, err
-	}
-	var (
-		duck           *sql.DB
-		quack          *quackClient
-		err            error
-		connectionKind = duckDBBaseConnection
-	)
 	if cfg.URL != "" {
-		quack, err = openQuackClient(cfg.URL, cfg.Token, cfg.AllowInsecure)
-		if err == nil {
-			duck = quack.DB()
-		}
-		connectionKind = duckDBQuackClientConnection
-	} else {
-		duck, err = Open(cfg.Path)
+		return fmt.Errorf("duckdb push writes the local mirror file and cannot " +
+			"push to a remote Quack endpoint; unset [duckdb].url / " +
+			"AGENTSVIEW_DUCKDB_URL for pushes and serve the mirror with " +
+			"'agentsview duckdb quack serve'")
 	}
-	if err != nil {
-		return nil, err
-	}
-	backfillTargetScope := opts.SyncStateTarget
-	if backfillTargetScope == "" {
-		if cfg.URL == "" {
-			backfillTargetScope = localDuckDBBackfillTargetScope(cfg.Path)
-		} else {
-			backfillTargetScope = SyncStateTargetForConfig(cfg)
-		}
-	}
-	return &Sync{
-		duck:                duck,
-		local:               local,
-		machine:             cfg.MachineName,
-		syncStateScope:      opts.SyncStateTarget,
-		backfillTargetScope: backfillTargetScope,
-		projects:            opts.Projects,
-		excludeProjects:     opts.ExcludeProjects,
-		connectionKind:      connectionKind,
-		quack:               quack,
-		maintenance:         duckDBCheckpointMaintenance{},
-	}, nil
+	return nil
 }
 
 // NewQuackStore attaches a remote DuckDB exposed over Quack.
@@ -259,16 +304,6 @@ func NewQuackStore(rawURL, token string, allowInsecure bool) (*Store, error) {
 		quack:          client,
 		connectionKind: duckDBQuackClientConnection,
 	}, nil
-}
-
-// OpenQuack opens an in-memory DuckDB client and attaches a remote DuckDB
-// exposed over Quack as the default catalog.
-func OpenQuack(rawURL, token string, allowInsecure bool) (*sql.DB, error) {
-	client, err := openQuackClient(rawURL, token, allowInsecure)
-	if err != nil {
-		return nil, err
-	}
-	return client.DB(), nil
 }
 
 type quackClient struct {
@@ -539,27 +574,6 @@ func (q *quackClient) queryRemote(
 		)
 	}
 	return q.duck.QueryContext(ctx, query, sqlText)
-}
-
-func (q *quackClient) execRemote(
-	ctx context.Context, sqlText string, retryStale bool,
-) error {
-	query := "FROM " + quackAttachmentName + ".query(?)"
-	_, err := q.duck.ExecContext(ctx, query, sqlText)
-	if err == nil || !retryStale || !isStaleQuackConnectionError(err) ||
-		ctx.Err() != nil {
-		return err
-	}
-	q.reattachMu.Lock()
-	defer q.reattachMu.Unlock()
-	if reattachErr := q.reattachLocked(ctx); reattachErr != nil {
-		return fmt.Errorf(
-			"%w; reattaching quack endpoint %s: %v",
-			err, RedactQuackURL(q.rawURL), reattachErr,
-		)
-	}
-	_, err = q.duck.ExecContext(ctx, query, sqlText)
-	return err
 }
 
 func isStaleQuackConnectionError(err error) bool {

@@ -4031,7 +4031,7 @@ func TestCopySessionMetadataFrom_PreservesCursorUsageEvents(t *testing.T) {
 
 	require.NoError(t, dstDB.CopySessionMetadataFrom(srcPath), "CopySessionMetadataFrom")
 
-	gotEvents, err := dstDB.GetCursorUsageEvents(ctx)
+	gotEvents, err := dstDB.GetCursorUsageEvents(ctx, 0)
 	require.NoError(t, err, "GetCursorUsageEvents")
 	require.Len(t, gotEvents, 2, "cursor usage events")
 	gotFingerprint, err := dstDB.CursorUsageEventFingerprint()
@@ -4736,6 +4736,78 @@ func TestBulkStarSessions(t *testing.T) {
 	ids, err := d.ListStarredSessionIDs(ctx)
 	require.NoError(t, err, "ListStarredSessionIDs")
 	assert.Equal(t, 2, len(ids), "listed")
+}
+
+func TestListStarredSessionIDsForScope(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	insertSession(t, d, "s1", "alpha")
+	insertSession(t, d, "s2", "beta")
+	insertSession(t, d, "s3", "beta")
+
+	_, err := d.StarSession("s1")
+	require.NoError(t, err, "StarSession s1")
+	_, err = d.StarSession("s2")
+	require.NoError(t, err, "StarSession s2")
+
+	all, err := d.ListStarredSessionIDsForScope(ctx, nil, nil)
+	require.NoError(t, err, "unfiltered scope")
+	assert.ElementsMatch(t, []string{"s1", "s2"}, all)
+
+	alphaOnly, err := d.ListStarredSessionIDsForScope(ctx, []string{"alpha"}, nil)
+	require.NoError(t, err, "include alpha")
+	assert.Equal(t, []string{"s1"}, alphaOnly)
+
+	excludeAlpha, err := d.ListStarredSessionIDsForScope(ctx, nil, []string{"alpha"})
+	require.NoError(t, err, "exclude alpha")
+	assert.Equal(t, []string{"s2"}, excludeAlpha)
+
+	betaOnly, err := d.ListStarredSessionIDsForScope(ctx, []string{"beta"}, nil)
+	require.NoError(t, err, "include beta (s3 unstarred)")
+	assert.Equal(t, []string{"s2"}, betaOnly)
+}
+
+func TestDeleteSyncStateByPrefix(t *testing.T) {
+	d := testDB(t)
+
+	require.NoError(t, d.SetSyncState("duckdb_last_push_at", "t1"))
+	require.NoError(t, d.SetSyncState("duckdb_last_push_at:work", "t2"))
+	require.NoError(t, d.SetSyncState("duckdb_last_push_boundary_state", "b1"))
+	require.NoError(t, d.SetSyncState("last_push_at", "keep-me"))
+
+	require.NoError(t, d.DeleteSyncStateByPrefix("duckdb_"))
+
+	for _, key := range []string{
+		"duckdb_last_push_at", "duckdb_last_push_at:work", "duckdb_last_push_boundary_state",
+	} {
+		value, err := d.GetSyncState(key)
+		require.NoError(t, err, "GetSyncState %s", key)
+		assert.Empty(t, value, "key %s should have been deleted", key)
+	}
+
+	kept, err := d.GetSyncState("last_push_at")
+	require.NoError(t, err, "GetSyncState last_push_at")
+	assert.Equal(t, "keep-me", kept, "unrelated keys must not be deleted")
+}
+
+func TestDeleteSyncStateByPrefixEscapesLikeMetacharacters(t *testing.T) {
+	d := testDB(t)
+
+	// Keys containing literal LIKE metacharacters (% and _) must only match
+	// as literal characters, not as wildcards: a prefix of "a_b" must not
+	// also delete "axb".
+	require.NoError(t, d.SetSyncState("a_b_target", "v1"))
+	require.NoError(t, d.SetSyncState("axb_unrelated", "v2"))
+
+	require.NoError(t, d.DeleteSyncStateByPrefix("a_b"))
+
+	deleted, err := d.GetSyncState("a_b_target")
+	require.NoError(t, err)
+	assert.Empty(t, deleted)
+
+	kept, err := d.GetSyncState("axb_unrelated")
+	require.NoError(t, err)
+	assert.Equal(t, "v2", kept, "underscore in prefix must not act as a wildcard")
 }
 
 func TestRestoreSession(t *testing.T) {
@@ -5673,6 +5745,17 @@ func TestOpenRepairsLegacyCurrentSchemaTokenCoverageOnce(t *testing.T) {
 		false, false,
 	)
 	requireNoError(t, err, "insert message")
+	// Backdate the marker signals so the repair's sync_marker advancement
+	// is observable: has_total_output_tokens/has_peak_context_tokens are
+	// mirrored by the push targets but are not sync_marker signals, so the
+	// repair must bump local_modified_at for the repaired rows to re-enter
+	// the incremental push window.
+	_, err = d.getWriter().Exec(
+		`UPDATE sessions SET created_at = '2026-07-01T10:00:00.000Z',
+			local_modified_at = '2026-07-01T10:00:00.000Z'
+		 WHERE id = 'current'`,
+	)
+	requireNoError(t, err, "backdate session")
 	_, err = d.getWriter().Exec(
 		`DELETE FROM stats WHERE key = ?`,
 		tokenCoverageRepairStatsKey,
@@ -5700,6 +5783,12 @@ func TestOpenRepairsLegacyCurrentSchemaTokenCoverageOnce(t *testing.T) {
 		"HasContextTokens = false, want true")
 	assert.True(t, msgs[0].HasOutputTokens,
 		"HasOutputTokens = false, want true")
+	var marker string
+	requireNoError(t, d.getReader().QueryRowContext(ctx,
+		`SELECT sync_marker FROM sessions WHERE id = 'current'`).Scan(&marker),
+		"read sync_marker after repair")
+	assert.Greater(t, marker, "2026-07-01T10:00:00.000Z",
+		"the coverage repair must advance sync_marker so push targets re-select the row")
 	_, err = d.getWriter().Exec(
 		`UPDATE sessions
 		 SET has_total_output_tokens = 0,

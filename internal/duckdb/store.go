@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -25,9 +26,23 @@ import (
 // Compile-time check: *Store satisfies db.Store.
 var _ db.Store = (*Store)(nil)
 
-// Store wraps a DuckDB connection for read-mostly serve mode.
+// Store wraps a DuckDB connection for read-mostly serve mode. path and
+// handleMu support live reopening after a mirror rebuild swaps in a new
+// file (see WatchMirrorReplacement in mirror_watch.go): handleMu guards
+// duck, fileInfo, and aliasPath so an in-flight query never observes a
+// handle mid-swap. path is empty for NewStoreFromDB and remote/Quack
+// stores, which have no local file to watch. aliasPath is the hardlink
+// (<base>.reopen-N inside the mirror's work directory) that duck is
+// actually opened against once the Store has reopened at least once (see
+// openMirrorAlias); it is "" for the original connection NewStore opens
+// directly on path.
 type Store struct {
-	duck           *sql.DB
+	path      string
+	handleMu  sync.RWMutex
+	duck      *sql.DB
+	fileInfo  os.FileInfo
+	aliasPath string
+
 	quack          *quackClient
 	connectionKind duckDBConnectionKind
 	cursorMu       sync.RWMutex
@@ -35,34 +50,83 @@ type Store struct {
 	customPricing  map[string]config.CustomModelRate
 }
 
-// NewStore opens a local DuckDB mirror file as a db.Store.
+// NewStore opens a local DuckDB mirror file as a db.Store. The handle is
+// read-only, so a serving Store coexists with other read-only opens (other
+// serve processes, push probes) and never blocks a push's probe; the Store's
+// db.Store surface is read-only anyway (see ReadOnly).
+//
+// The file identity is captured BEFORE the mirror is opened, matching
+// checkMirrorReplacement's stat-then-open order. If a rebuild swaps the
+// file inside the stat/open window, the connection serves the new
+// generation while fileInfo still describes the old one, so the
+// replacement watcher fires once and reopens onto the file it is already
+// serving — a harmless extra reopen. The reverse order inverts the race:
+// the connection serves the old generation while fileInfo describes the
+// new one, so the watcher never sees a change and the Store serves stale
+// data until the next rebuild.
 func NewStore(path string) (*Store, error) {
-	conn, err := Open(path)
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("statting duckdb mirror %s: %w", path, err)
+	}
+	PrimeFileIdentity(info)
+	conn, err := OpenReadOnly(path)
 	if err != nil {
 		return nil, err
 	}
-	return &Store{duck: conn}, nil
+	return &Store{path: path, duck: conn, fileInfo: info}, nil
 }
 
 // NewStoreFromDB wraps an existing DuckDB connection.
 func NewStoreFromDB(conn *sql.DB) *Store { return &Store{duck: conn} }
 
-func (s *Store) DB() *sql.DB { return s.duck }
+// DB returns the current handle under a read lock. Callers that hold onto
+// the returned *sql.DB across a mirror replacement keep using the old
+// handle until they call DB() again; this is acceptable for the existing
+// callers, which only use DB() once at startup for compat checks.
+func (s *Store) DB() *sql.DB {
+	s.handleMu.RLock()
+	defer s.handleMu.RUnlock()
+	return s.duck
+}
 
-func (s *Store) Close() error { return s.duck.Close() }
+func (s *Store) Close() error {
+	s.handleMu.Lock()
+	defer s.handleMu.Unlock()
+	err := s.duck.Close()
+	removeMirrorAlias(s.aliasPath)
+	return err
+}
 
+// queryContext runs a read query against the current handle. The read
+// lock is held across the query START, not just a handle snapshot: a
+// snapshot taken under a released lock could be Close()d by
+// WatchMirrorReplacement's swapHandle before QueryContext begins,
+// surfacing as intermittent "sql: database is closed" errors during
+// mirror adoption. Once QueryContext returns, the *sql.Rows holds a
+// checked-out connection that database/sql keeps alive across DB.Close
+// (busy connections are only closed when returned to the pool), so
+// iterating the rows after the lock is released is safe. The quack-remote
+// path performs an HTTP round trip under this read lock; that is
+// acceptable because replacement swaps only occur for local mirrors.
 func (s *Store) queryContext(
 	ctx context.Context, query string, args ...any,
 ) (*sql.Rows, error) {
+	s.handleMu.RLock()
+	defer s.handleMu.RUnlock()
 	return queryDuckDBContext(ctx, s.duck, s.connectionKind, s.quack, query, args...)
 }
 
+// queryRowContext holds the read lock across the query start for the same
+// reason as queryContext. sql.DB.QueryRowContext executes the query
+// eagerly (the returned row only carries the already-fetched result), so
+// releasing the lock before Scan is safe.
 func (s *Store) queryRowContext(
 	ctx context.Context, query string, args ...any,
 ) interface{ Scan(...any) error } {
-	return queryDuckDBRowContext(
-		ctx, s.duck, s.connectionKind, s.quack, query, args...,
-	)
+	s.handleMu.RLock()
+	defer s.handleMu.RUnlock()
+	return queryDuckDBRowContext(ctx, s.duck, s.connectionKind, s.quack, query, args...)
 }
 
 func queryDuckDBContext(
@@ -706,7 +770,7 @@ func (s *Store) GetMachines(ctx context.Context, excludeOneShot, excludeAutomate
 }
 
 func (s *Store) GetBranches(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]db.BranchInfo, error) {
-	rows, err := s.duck.QueryContext(ctx,
+	rows, err := s.queryContext(ctx,
 		`SELECT DISTINCT project, git_branch FROM sessions WHERE `+
 			rootSessionWhere(excludeOneShot, excludeAutomated)+
 			` ORDER BY project, git_branch`,
@@ -956,7 +1020,9 @@ func (s *Store) SearchContent(ctx context.Context, f db.ContentSearchFilter) (db
 		}
 		// No VectorSearcher seam on the DuckDB store yet (HasSemantic always
 		// false): gate after input validation.
-		return db.ContentSearchPage{}, db.ErrSemanticUnavailable
+		return db.ContentSearchPage{}, db.NewSemanticUnavailableError(
+			"semantic search is not supported by the DuckDB backend",
+		)
 	}
 
 	if len(f.Sources) == 0 {

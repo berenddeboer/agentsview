@@ -107,6 +107,34 @@ func TestClassifyProviderChangedPathSchedulesStoredSourceHintsByCapability(t *te
 	}
 }
 
+func TestProviderChangedPathStoredHintRootsTraeScopesToContainer(t *testing.T) {
+	root := t.TempDir()
+	workspaceWatchRoot := filepath.Join(root, "workspaceStorage")
+	globalWatchRoot := filepath.Join(root, "globalStorage")
+
+	workspaceManifest := filepath.Join(
+		workspaceWatchRoot, "hash-a", "workspace.json",
+	)
+	require.NoError(t, os.MkdirAll(filepath.Dir(workspaceManifest), 0o755))
+	assert.Equal(
+		t,
+		[]string{filepath.Join(workspaceWatchRoot, "hash-a", "state.vscdb")},
+		providerChangedPathStoredHintRoots(
+			parser.AgentTrae, workspaceWatchRoot, workspaceManifest,
+		),
+	)
+
+	globalDB := filepath.Join(globalWatchRoot, "state.vscdb")
+	require.NoError(t, os.MkdirAll(filepath.Dir(globalDB), 0o755))
+	assert.Equal(
+		t,
+		[]string{globalDB},
+		providerChangedPathStoredHintRoots(
+			parser.AgentTrae, globalWatchRoot, globalDB+"-wal",
+		),
+	)
+}
+
 func TestClassifyCodexChangedPathAllocationsStayBounded(t *testing.T) {
 	measure := func(t *testing.T, hintCount int) float64 {
 		t.Helper()
@@ -243,6 +271,20 @@ func TestClassifyProviderChangedPathPreservesHintDependentTombstones(t *testing.
 				writeSyncWindsurfStateDB(t, path, windsurfSyncPayload("deleted", "reply"))
 				updateSyncWindsurfStateDB(t, path, `{}`)
 				return root, path, path + "#deleted"
+			},
+		},
+		{
+			name: "Trae multi-session container", agent: parser.AgentTrae,
+			setup: func(t *testing.T) (string, string, string) {
+				root := t.TempDir()
+				path := filepath.Join(root, "globalStorage", "state.vscdb")
+				writeTraeSyncDB(t, path, "reply")
+				store, err := sql.Open("sqlite3", path)
+				require.NoError(t, err)
+				_, err = store.Exec(`UPDATE ItemTable SET value = ? WHERE key = ?`, `{"list":[]}`, "memento/icube-ai-agent-storage")
+				require.NoError(t, err)
+				require.NoError(t, store.Close())
+				return root, path, path + "#rewrite"
 			},
 		},
 	}

@@ -272,6 +272,7 @@ can still be parsed.
 | Visual Studio Copilot | (platform-specific, see below)                                                   | Trace JSONL files                                                                                                               |
 | VS Code Copilot       | (platform-specific, see below)                                                   | JSON / JSONL per session                                                                                                        |
 | Windsurf              | (platform-specific, see below)                                                   | SQLite `workspaceStorage/<hash>/state.vscdb` workspace chat data                                                                |
+| Trae                  | (platform-specific, see below)                                                   | SQLite `workspaceStorage/<hash>/state.vscdb` and `globalStorage/state.vscdb` chat data                                        |
 | Warp                  | (platform-specific, see below)                                                   | SQLite database                                                                                                                 |
 | WorkBuddy             | `~/.workbuddy/projects/`                                                         | JSONL per session                                                                                                               |
 | ZCode                 | `~/.zcode/cli/db/` or `~/.zcode/cli/`                                            | SQLite database (`db.sqlite`) with usage rows                                                                                   |
@@ -311,9 +312,24 @@ named like `*_VSGitHubCopilot_traces.jsonl`; set `VISUALSTUDIO_COPILOT_DIR` or
 - **Windows:** `%APPDATA%/Windsurf/User/` and `%APPDATA%/Windsurf - Next/User/`
 
 Windsurf stores workspace chats in `workspaceStorage/<hash>/state.vscdb`.
-AgentsView watches the `workspaceStorage` subtree and reads chat records from
-that SQLite database. Set `WINDSURF_DIR` or `windsurf_dirs` if your user-data
-directory is somewhere else.
+
+**Trae default directories** vary by platform:
+
+- **macOS:** `~/Library/Application Support/Trae/User/`, `Trae CN/User/`, and `TRAE SOLO CN/User/`
+- **Linux:** `~/.config/Trae/User/`, `Trae CN/User/`, and `TRAE SOLO CN/User/`
+- **Windows:** `%APPDATA%/Trae/User/`, `Trae CN/User/`, and `TRAE SOLO CN/User/`
+
+Trae stores chats in `workspaceStorage/<hash>/state.vscdb` and
+`globalStorage/state.vscdb`. Override these roots with `TRAE_DIR` or the
+`trae_dirs` configuration key.
+AgentsView watches `workspaceStorage` and `globalStorage`, then reads chat
+records from those SQLite stores.
+
+Trae local parsing is supported, but remote HTTP and SSH target resolution is
+still disabled. A Trae root is a full user profile, and AgentsView does not
+archive or ship that profile wholesale. The follow-up path is Windsurf-style
+curated file targets only: `state.vscdb`, `state.vscdb-wal`, and
+`workspace.json` for each supported workspace store.
 
 **Positron Assistant default directory** (macOS only):
 
