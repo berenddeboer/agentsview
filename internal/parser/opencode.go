@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
@@ -68,24 +69,42 @@ func decodeOpenCodeEventCursor(value string) (openCodeEventCursor, error) {
 // modifying the source database. SQLite rowid is insertion ordered; the
 // container state detects replacement, VACUUM, deletion, and rowid reuse.
 func OpenCodeEventCursor(dbPath string) (string, bool, error) {
-	db, err := openOpenCodeDB(dbPath)
+	return OpenCodeEventCursorContext(context.Background(), dbPath)
+}
+
+// OpenCodeEventCursorContext is the cancellable form of OpenCodeEventCursor.
+func OpenCodeEventCursorContext(
+	ctx context.Context,
+	dbPath string,
+) (string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	db, err := openOpenCodeDBContext(dbPath)
 	if err != nil {
 		return "", false, err
 	}
 	defer db.Close()
 
-	if !openCodeEventJournalSupported(db) {
+	supported, err := openCodeEventJournalSupported(ctx, db)
+	if err != nil {
+		return "", false, err
+	}
+	if !supported {
 		return "", false, nil
 	}
 	state, ok := StatSQLiteContainerState(dbPath)
 	if !ok {
 		return "", true, fmt.Errorf("reading opencode container state")
 	}
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
 	var (
 		rowID      int64
 		boundaryID string
 	)
-	err = db.QueryRow(`
+	err = db.QueryRowContext(ctx, `
 		SELECT COALESCE(MAX(rowid), 0),
 		       COALESCE((SELECT id FROM event ORDER BY rowid DESC LIMIT 1), '')
 		FROM event
@@ -93,7 +112,9 @@ func OpenCodeEventCursor(dbPath string) (string, bool, error) {
 		&rowID, &boundaryID,
 	)
 	if err != nil {
-		return "", true, fmt.Errorf("reading opencode event cursor: %w", err)
+		return "", true, fmt.Errorf(
+			"reading opencode event cursor: %w", preferContextError(ctx, err),
+		)
 	}
 	cursor, err := encodeOpenCodeEventCursor(openCodeEventCursor{
 		RowID:      rowID,
@@ -110,20 +131,46 @@ func OpenCodeEventCursor(dbPath string) (string, bool, error) {
 // container changed without a new event, or the batch contains a non-session
 // aggregate; callers then fall back to full container discovery.
 func ListOpenCodeEventDelta(dbPath, cursor string) (OpenCodeEventDelta, error) {
-	return listOpenCodeEventDeltaAt(dbPath, cursor, time.Now())
+	return ListOpenCodeEventDeltaContext(context.Background(), dbPath, cursor)
+}
+
+// ListOpenCodeEventDeltaContext is the cancellable form of
+// ListOpenCodeEventDelta.
+func ListOpenCodeEventDeltaContext(
+	ctx context.Context,
+	dbPath, cursor string,
+) (OpenCodeEventDelta, error) {
+	return listOpenCodeEventDeltaAtContext(ctx, dbPath, cursor, time.Now())
 }
 
 func listOpenCodeEventDeltaAt(
 	dbPath, cursor string,
 	now time.Time,
 ) (OpenCodeEventDelta, error) {
-	db, err := openOpenCodeDB(dbPath)
+	return listOpenCodeEventDeltaAtContext(
+		context.Background(), dbPath, cursor, now,
+	)
+}
+
+func listOpenCodeEventDeltaAtContext(
+	ctx context.Context,
+	dbPath, cursor string,
+	now time.Time,
+) (OpenCodeEventDelta, error) {
+	if err := ctx.Err(); err != nil {
+		return OpenCodeEventDelta{}, err
+	}
+	db, err := openOpenCodeDBContext(dbPath)
 	if err != nil {
 		return OpenCodeEventDelta{}, err
 	}
 	defer db.Close()
 
-	if !openCodeEventJournalSupported(db) {
+	supported, err := openCodeEventJournalSupported(ctx, db)
+	if err != nil {
+		return OpenCodeEventDelta{}, err
+	}
+	if !supported {
 		return OpenCodeEventDelta{}, nil
 	}
 	previous, err := decodeOpenCodeEventCursor(cursor)
@@ -134,10 +181,15 @@ func listOpenCodeEventDeltaAt(
 	if !ok {
 		return OpenCodeEventDelta{Supported: true}, nil
 	}
+	if err := ctx.Err(); err != nil {
+		return OpenCodeEventDelta{}, err
+	}
 
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return OpenCodeEventDelta{}, fmt.Errorf("starting opencode event read: %w", err)
+		return OpenCodeEventDelta{}, fmt.Errorf(
+			"starting opencode event read: %w", preferContextError(ctx, err),
+		)
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -145,7 +197,7 @@ func listOpenCodeEventDeltaAt(
 		high       int64
 		boundaryID string
 	)
-	err = tx.QueryRow(`
+	err = tx.QueryRowContext(ctx, `
 		SELECT COALESCE(MAX(rowid), 0),
 		       COALESCE((SELECT id FROM event ORDER BY rowid DESC LIMIT 1), '')
 		FROM event
@@ -153,18 +205,23 @@ func listOpenCodeEventDeltaAt(
 		&high, &boundaryID,
 	)
 	if err != nil {
-		return OpenCodeEventDelta{}, fmt.Errorf("reading opencode event cursor: %w", err)
+		return OpenCodeEventDelta{}, fmt.Errorf(
+			"reading opencode event cursor: %w", preferContextError(ctx, err),
+		)
 	}
 	boundaryReused := false
 	if previous.RowID > 0 && previous.BoundaryID != "" {
 		var currentBoundary string
-		err = tx.QueryRow(
+		err = tx.QueryRowContext(
+			ctx,
 			"SELECT id FROM event WHERE rowid = ?", previous.RowID,
 		).Scan(&currentBoundary)
 		boundaryReused = err == sql.ErrNoRows ||
 			(err == nil && currentBoundary != previous.BoundaryID)
 		if err != nil && err != sql.ErrNoRows {
-			return OpenCodeEventDelta{}, fmt.Errorf("reading opencode event boundary: %w", err)
+			return OpenCodeEventDelta{}, fmt.Errorf(
+				"reading opencode event boundary: %w", preferContextError(ctx, err),
+			)
 		}
 	}
 	replacementUnknown := previous.State.DBInode == 0 || state.DBInode == 0
@@ -182,7 +239,7 @@ func listOpenCodeEventDeltaAt(
 	ready := make(map[string]struct{})
 	complete := true
 	if high > previous.RowID {
-		rows, err := tx.Query(`
+		rows, err := tx.QueryContext(ctx, `
 			SELECT aggregate_id,
 			       type,
 			       COALESCE(CAST(json_extract(data, '$.time') AS INTEGER), 0),
@@ -194,10 +251,16 @@ func listOpenCodeEventDeltaAt(
 			ORDER BY rowid
 		`, previous.RowID, high)
 		if err != nil {
-			return OpenCodeEventDelta{}, fmt.Errorf("listing opencode events: %w", err)
+			return OpenCodeEventDelta{}, fmt.Errorf(
+				"listing opencode events: %w", preferContextError(ctx, err),
+			)
 		}
 		nowMS := now.UnixMilli()
 		for rows.Next() {
+			if err := ctx.Err(); err != nil {
+				rows.Close()
+				return OpenCodeEventDelta{}, err
+			}
 			var (
 				aggregateID string
 				eventType   string
@@ -240,8 +303,13 @@ func listOpenCodeEventDeltaAt(
 			return OpenCodeEventDelta{}, fmt.Errorf("closing opencode events: %w", err)
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return OpenCodeEventDelta{}, err
+	}
 	if err := tx.Commit(); err != nil {
-		return OpenCodeEventDelta{}, fmt.Errorf("finishing opencode event read: %w", err)
+		return OpenCodeEventDelta{}, fmt.Errorf(
+			"finishing opencode event read: %w", preferContextError(ctx, err),
+		)
 	}
 
 	ids := make([]string, 0, len(ready)+len(pending))
@@ -297,14 +365,20 @@ func openCodeEventSettlesSession(
 		(role == "user" || completed || failed)
 }
 
-func openCodeEventJournalSupported(db *sql.DB) bool {
+func openCodeEventJournalSupported(
+	ctx context.Context,
+	db *sql.DB,
+) (bool, error) {
 	var count int
-	err := db.QueryRow(`
+	err := db.QueryRowContext(ctx, `
 		SELECT COUNT(*)
 		FROM sqlite_schema
 		WHERE type = 'table' AND name IN ('event', 'event_sequence')
 	`).Scan(&count)
-	return err == nil && count == 2
+	if err != nil {
+		return false, preferContextError(ctx, err)
+	}
+	return count == 2, nil
 }
 
 // OpenCodeSQLiteSessionExists reports whether a session row with
@@ -388,35 +462,68 @@ func ListOpenCodeSessionMetaByID(
 	dbPath string,
 	sessionIDs []string,
 ) ([]OpenCodeSessionMeta, error) {
+	return ListOpenCodeSessionMetaByIDContext(
+		context.Background(), dbPath, sessionIDs,
+	)
+}
+
+// ListOpenCodeSessionMetaByIDContext is the cancellable form of
+// ListOpenCodeSessionMetaByID.
+func ListOpenCodeSessionMetaByIDContext(
+	ctx context.Context,
+	dbPath string,
+	sessionIDs []string,
+) ([]OpenCodeSessionMeta, error) {
 	if len(sessionIDs) == 0 {
 		return nil, nil
 	}
-	db, err := openOpenCodeDB(dbPath)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	db, err := openOpenCodeDBContext(dbPath)
 	if err != nil {
 		return nil, err
 	}
 	defer db.Close()
 
-	stmt, err := db.Prepare(`
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"starting opencode session metadata read: %w",
+			preferContextError(ctx, err),
+		)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stmt, err := tx.PrepareContext(ctx, `
 		SELECT project_id, time_updated
 		FROM session
 		WHERE id = ?
 	`)
 	if err != nil {
-		return nil, fmt.Errorf("preparing opencode session metadata lookup: %w", err)
+		return nil, fmt.Errorf(
+			"preparing opencode session metadata lookup: %w",
+			preferContextError(ctx, err),
+		)
 	}
 	defer stmt.Close()
 
 	metas := make([]OpenCodeSessionMeta, 0, len(sessionIDs))
 	for _, id := range sessionIDs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		var projectID string
 		var timeUpdated int64
-		err := stmt.QueryRow(id).Scan(&projectID, &timeUpdated)
+		err := stmt.QueryRowContext(ctx, id).Scan(&projectID, &timeUpdated)
 		if err == sql.ErrNoRows {
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("reading opencode session metadata: %w", err)
+			return nil, fmt.Errorf(
+				"reading opencode session metadata: %w",
+				preferContextError(ctx, err),
+			)
 		}
 		metas = append(metas, OpenCodeSessionMeta{
 			SessionID:   id,
@@ -424,6 +531,15 @@ func ListOpenCodeSessionMetaByID(
 			VirtualPath: dbPath + "#" + id,
 			FileMtime:   timeUpdated * 1_000_000,
 		})
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf(
+			"finishing opencode session metadata read: %w",
+			preferContextError(ctx, err),
+		)
 	}
 	return metas, nil
 }
@@ -550,8 +666,21 @@ func parseOpenCodeStorageFile(
 }
 
 func openOpenCodeDB(dbPath string) (*sql.DB, error) {
+	return openOpenCodeDBWithBusyTimeout(dbPath, 3000)
+}
+
+func openOpenCodeDBContext(dbPath string) (*sql.DB, error) {
+	// go-sqlite3 does not interrupt its native busy handler through Context.
+	// Keep watcher reads responsive to cancellation by bounding each busy wait.
+	return openOpenCodeDBWithBusyTimeout(dbPath, 100)
+}
+
+func openOpenCodeDBWithBusyTimeout(
+	dbPath string,
+	busyTimeoutMS int,
+) (*sql.DB, error) {
 	dsn := "file:" + sqliteURIPath(dbPath) +
-		"?mode=ro&_busy_timeout=3000"
+		fmt.Sprintf("?mode=ro&_busy_timeout=%d", busyTimeoutMS)
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -559,6 +688,13 @@ func openOpenCodeDB(dbPath string) (*sql.DB, error) {
 		)
 	}
 	return db, nil
+}
+
+func preferContextError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return err
 }
 
 // openCodeProject is a row from the opencode project table.

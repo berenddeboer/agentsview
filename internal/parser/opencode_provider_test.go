@@ -535,6 +535,49 @@ func TestOpenCodeProviderHybridDiscoveryFiltersSQLiteDuplicate(t *testing.T) {
 	assert.Equal(t, storagePath, found.DisplayPath)
 }
 
+func TestOpenCodeProviderSQLiteDeltaFallsBackForCrossProjectStorageDuplicate(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	storagePath := writeOpenCodeProviderStorageSession(
+		t, root, "session", "ses_cross_project", "storage-app", "Storage Session",
+	)
+	dbPath, seeder, db := newTestDBAt(t, filepath.Join(root, "opencode.db"))
+	defer db.Close()
+	seedOpenCodeEventJournal(t, db)
+	seeder.AddProject("prj_sqlite", "/home/user/code/sqlite-app")
+	seeder.AddSession(
+		"ses_cross_project", "prj_sqlite", "", "SQLite Shadow", 1, 2,
+	)
+	addOpenCodeEvent(
+		t, db, "evt_001", "ses_cross_project", "session.created.1", 1,
+	)
+	cursor, supported, err := OpenCodeEventCursor(dbPath)
+	require.NoError(t, err)
+	require.True(t, supported)
+	addOpenCodeEvent(
+		t, db, "evt_002", "ses_cross_project", "session.updated.1", 2,
+	)
+
+	provider, ok := NewProvider(AgentOpenCode, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	cursorProvider, ok := provider.(ChangedPathCursorProvider)
+	require.True(t, ok)
+	result, err := cursorProvider.SourcesForChangedPathCursor(
+		context.Background(),
+		ChangedPathRequest{
+			Path:          dbPath,
+			EventKind:     "write",
+			WatchRoot:     root,
+			ChangeCursors: map[string]string{dbPath: cursor},
+		},
+	)
+	require.NoError(t, err)
+	assert.Empty(t, result.Sources,
+		"full fallback must suppress the shadowed SQLite row")
+	assert.NotEmpty(t, storagePath, "fixture must include a canonical storage copy")
+}
+
 func TestOpenCodeProviderDiscoveryToleratesCorruptSQLiteDB(t *testing.T) {
 
 	root := t.TempDir()

@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -302,6 +303,58 @@ func TestListOpenCodeEventDelta(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(4), decoded.RowID)
 	assert.Equal(t, []string{"ses_a", "ses_b"}, delta.SessionIDs)
+}
+
+func TestOpenCodeIncrementalSQLiteReadsHonorCancellation(t *testing.T) {
+	dbPath, seeder, db := newTestDB(t)
+	seedOpenCodeEventJournal(t, db)
+	seeder.AddProject("prj_cancel", "/tmp/cancel")
+	seeder.AddSession("ses_cancel", "prj_cancel", "", "Cancel", 1, 2)
+	addOpenCodeEvent(t, db, "evt_001", "ses_cancel", "session.created.1", 1)
+	cursor, supported, err := OpenCodeEventCursor(dbPath)
+	require.NoError(t, err)
+	require.True(t, supported)
+	require.NoError(t, db.Close())
+
+	locker, err := sql.Open("sqlite3", dbPath+"?_busy_timeout=3000")
+	require.NoError(t, err)
+	defer locker.Close()
+	locker.SetMaxOpenConns(1)
+	_, err = locker.Exec("BEGIN EXCLUSIVE")
+	require.NoError(t, err)
+	defer func() { _, _ = locker.Exec("ROLLBACK") }()
+
+	for _, tc := range []struct {
+		name string
+		read func(context.Context) error
+	}{
+		{
+			name: "event delta",
+			read: func(ctx context.Context) error {
+				_, readErr := ListOpenCodeEventDeltaContext(ctx, dbPath, cursor)
+				return readErr
+			},
+		},
+		{
+			name: "session metadata",
+			read: func(ctx context.Context) error {
+				_, readErr := ListOpenCodeSessionMetaByIDContext(
+					ctx, dbPath, []string{"ses_cancel"},
+				)
+				return readErr
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer cancel()
+			started := time.Now()
+			err := tc.read(ctx)
+			require.ErrorIs(t, err, context.DeadlineExceeded)
+			assert.Less(t, time.Since(started), time.Second,
+				"cancellation must beat SQLite's three-second busy timeout")
+		})
+	}
 }
 
 func TestListOpenCodeEventDeltaFallsBackWhenDatabaseIsReplacedAndAdvances(

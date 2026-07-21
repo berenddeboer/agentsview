@@ -112,7 +112,7 @@ func (p *openCodeFormatProvider) CurrentChangedPathCursors(
 			continue
 		}
 		seen[dbPath] = struct{}{}
-		cursor, supported, err := OpenCodeEventCursor(dbPath)
+		cursor, supported, err := OpenCodeEventCursorContext(ctx, dbPath)
 		if err != nil {
 			return nil, err
 		}
@@ -454,7 +454,7 @@ func (s openCodeFormatSourceSet) SourcesForChangedPathCursor(
 			continue
 		}
 		dbPath := filepath.Join(root, s.spec.dbName)
-		cursor, supported, cursorErr := OpenCodeEventCursor(dbPath)
+		cursor, supported, cursorErr := OpenCodeEventCursorContext(ctx, dbPath)
 		if cursorErr != nil {
 			return ChangedPathCursorResult{}, cursorErr
 		}
@@ -639,25 +639,35 @@ func (s openCodeFormatSourceSet) sqliteSourcesByID(
 	root string,
 	dbPath string,
 	sessionIDs []string,
-) ([]SourceRef, error) {
+) ([]SourceRef, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	metas, err := ListOpenCodeSessionMetaByID(dbPath, sessionIDs)
+	metas, err := ListOpenCodeSessionMetaByIDContext(ctx, dbPath, sessionIDs)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
+	storageMode := s.spec.resolve(root).Mode == OpenCodeSourceStorage
 	sources := make([]SourceRef, 0, len(metas))
 	for _, meta := range metas {
-		if s.storageSessionExists(root, meta.ProjectID, meta.SessionID) {
-			continue
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
+		if storageMode {
+			if s.storageSessionExists(root, meta.ProjectID, meta.SessionID) {
+				continue
+			}
+			// A storage copy may live under another project directory (for
+			// example, global). Only full discovery's session-ID index can prove
+			// that it is absent without scanning every project per changed row.
+			return nil, false, nil
 		}
 		if source, ok := s.sqliteSourceRefFromMeta(root, meta); ok {
 			source.ContentChanged = true
 			sources = append(sources, source)
 		}
 	}
-	return sources, nil
+	return sources, true, nil
 }
 
 func (s openCodeFormatSourceSet) storageSessionExists(
@@ -705,16 +715,22 @@ func (s openCodeFormatSourceSet) sqliteDeltaForChangedPathInRoot(
 	if !initialized {
 		return ChangedPathCursorResult{}, false, nil
 	}
-	delta, err := ListOpenCodeEventDelta(dbPath, cursor)
+	delta, err := ListOpenCodeEventDeltaContext(ctx, dbPath, cursor)
 	if err != nil {
 		return ChangedPathCursorResult{}, true, err
 	}
 	if !delta.Supported || !delta.Complete {
 		return ChangedPathCursorResult{}, false, nil
 	}
-	sources, err := s.sqliteSourcesByID(
+	sources, resolved, err := s.sqliteSourcesByID(
 		ctx, root, dbPath, delta.SessionIDs,
 	)
+	if err != nil {
+		return ChangedPathCursorResult{}, true, err
+	}
+	if !resolved {
+		return ChangedPathCursorResult{}, false, nil
+	}
 	return ChangedPathCursorResult{
 		Sources: sources,
 		Cursors: []ChangedPathCursor{{Key: dbPath, Value: delta.Cursor}},
@@ -723,7 +739,7 @@ func (s openCodeFormatSourceSet) sqliteDeltaForChangedPathInRoot(
 			After:   delta.RetryAfter,
 			Pending: delta.RetryAfter > 0,
 		}},
-	}, true, err
+	}, true, nil
 }
 
 // sqliteSourceRefFromMeta builds a SourceRef for a session row already listed
