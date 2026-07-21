@@ -14,6 +14,14 @@ import (
 
 var _ Provider = (*openCodeFormatProvider)(nil)
 
+// OpenCodeTargetedSourceProvider constructs virtual sources for a bounded set
+// of journal-selected OpenCode session IDs without scanning storage or SQLite.
+type OpenCodeTargetedSourceProvider interface {
+	OpenCodeSourcesForSessionIDs(
+		context.Context, string, []string,
+	) ([]SourceRef, error)
+}
+
 // A SQLite WAL begins with a 32-byte header. Bytes beyond the header are
 // transaction frames, so a larger WAL can contain source changes worth
 // syncing. Read-only SQLite connections may create an empty WAL and its SHM
@@ -102,6 +110,34 @@ func (p *openCodeFormatProvider) SourceForReconciliation(
 	ctx context.Context, path, project string,
 ) (SourceRef, bool, error) {
 	return p.sources.SourceForReconciliation(ctx, path, project)
+}
+
+func (p *openCodeFormatProvider) OpenCodeSourcesForSessionIDs(
+	ctx context.Context, dbPath string, sessionIDs []string,
+) ([]SourceRef, error) {
+	if p.Def.Type != AgentOpenCode {
+		return nil, nil
+	}
+	for _, root := range p.sources.roots {
+		if filepath.Clean(filepath.Join(root, p.sources.spec.dbName)) != filepath.Clean(dbPath) {
+			continue
+		}
+		metas, err := ListOpenCodeSessionMetaByID(ctx, dbPath, sessionIDs)
+		if err != nil {
+			return nil, err
+		}
+		sources := make([]SourceRef, 0, len(metas))
+		for _, meta := range metas {
+			source, ok := p.sources.sqliteSourceRefFromMeta(root, meta)
+			if !ok {
+				continue
+			}
+			source.ContentChanged = true
+			sources = append(sources, source)
+		}
+		return sources, nil
+	}
+	return nil, nil
 }
 
 func (p *openCodeFormatProvider) FindSource(
@@ -877,6 +913,11 @@ func (s openCodeFormatSourceSet) sourcesForChangedPathInRoot(
 	if isSQLiteChange {
 		dbPath := filepath.Join(root, s.spec.dbName)
 		if !IsRegularFile(dbPath) {
+			return nil, true, nil
+		}
+		// OpenCode database events are classified by the engine-owned bounded
+		// journal fast path. Never fall back to enumerating the container here.
+		if s.spec.agent == AgentOpenCode {
 			return nil, true, nil
 		}
 		storageIDs := map[string]struct{}{}

@@ -260,6 +260,11 @@ type SourceRef struct {
 	ReconciliationIdentity string
 	// ProjectHint is advisory metadata for UI grouping and may be empty.
 	ProjectHint string
+	// ContentChanged means a bounded source-side journal positively selected
+	// this source even though its coarse size or mtime may be unchanged. The
+	// engine bypasses pre-parse freshness gates but still applies the parsed
+	// content fingerprint before writing.
+	ContentChanged bool
 	// DiscoveryMTimeNS is an optional per-source modification time in Unix
 	// nanoseconds captured at discovery. Providers whose sources are virtual --
 	// a shared store fanned out to one source per session, where DisplayPath is

@@ -228,6 +228,19 @@ const openCodeLikeSchema = `
 		data TEXT NOT NULL,
 		time_created INTEGER NOT NULL
 	);
+	CREATE TABLE event_sequence (
+		aggregate_id TEXT PRIMARY KEY,
+		seq INTEGER NOT NULL
+	);
+	CREATE TABLE event (
+		id TEXT PRIMARY KEY,
+		aggregate_id TEXT NOT NULL,
+		seq INTEGER NOT NULL,
+		type TEXT NOT NULL,
+		data TEXT NOT NULL
+	);
+	CREATE UNIQUE INDEX event_aggregate_seq_idx
+		ON event (aggregate_id, seq);
 `
 
 const kiroSQLiteSchema = `
@@ -487,6 +500,18 @@ func (oc *openCodeTestDB) updateMessageData(
 		"UPDATE message SET data = ? WHERE id = ?",
 		string(raw), id,
 	)
+}
+
+func (oc *openCodeTestDB) addEvent(
+	t *testing.T, id, sessionID, eventType, data string, seq int,
+) {
+	t.Helper()
+	oc.mustExec(t, "insert event", `
+		INSERT INTO event_sequence (aggregate_id, seq) VALUES (?, ?)
+		ON CONFLICT (aggregate_id) DO UPDATE SET seq = excluded.seq;
+		INSERT INTO event (id, aggregate_id, seq, type, data)
+		VALUES (?, ?, ?, ?, ?)
+	`, sessionID, seq, id, sessionID, seq, eventType, data)
 }
 
 func (oc *openCodeTestDB) addTextPart(

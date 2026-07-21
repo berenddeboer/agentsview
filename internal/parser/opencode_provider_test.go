@@ -527,7 +527,17 @@ func TestOpenCodeProviderSQLiteSourceMethods(t *testing.T) {
 		ChangedPathRequest{Path: dbPath, EventKind: "write", WatchRoot: root},
 	)
 	require.NoError(t, err)
-	requireSourcePathsMatch(t, changed, fixture.AllVirtualPaths)
+	assert.Empty(t, changed, "OpenCode DB events must not enumerate the container")
+
+	targeted, ok := provider.(OpenCodeTargetedSourceProvider)
+	require.True(t, ok)
+	changed, err = targeted.OpenCodeSourcesForSessionIDs(
+		context.Background(), dbPath, []string{fixture.TargetSessionID},
+	)
+	require.NoError(t, err)
+	require.Len(t, changed, 1)
+	assert.Equal(t, virtualPath, changed[0].DisplayPath)
+	assert.True(t, changed[0].ContentChanged)
 
 	changed, err = provider.SourcesForChangedPath(
 		context.Background(),
@@ -671,6 +681,12 @@ func TestOpenCodeProviderReadsLiveSQLiteWAL(t *testing.T) {
 			EventKind: "write",
 			WatchRoot: filepath.Dir(dbPath),
 		},
+	)
+	require.NoError(t, err)
+	assert.Empty(t, changed)
+	targeted := provider.(OpenCodeTargetedSourceProvider)
+	changed, err = targeted.OpenCodeSourcesForSessionIDs(
+		context.Background(), dbPath, []string{"ses_abc"},
 	)
 	require.NoError(t, err)
 	require.Len(t, changed, 1)

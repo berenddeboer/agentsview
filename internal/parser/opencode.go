@@ -27,6 +27,203 @@ type OpenCodeSessionMeta struct {
 	FileMtime   int64
 }
 
+// OpenCodeJournalEvent is the session-level interpretation of one recognized
+// OpenCode event row. Settlement is false for streaming updates that should be
+// coalesced until a turn boundary arrives.
+type OpenCodeJournalEvent struct {
+	SessionID  string
+	Settlement bool
+}
+
+// OpenCodeJournalBatch is a bounded, transactionally consistent event range.
+// Supported is false when the source does not expose the verified OpenCode
+// journal schema. Safe is false when targeted classification cannot be proven.
+type OpenCodeJournalBatch struct {
+	HighRowID int64
+	Events    []OpenCodeJournalEvent
+	Supported bool
+	Safe      bool
+	Overflow  bool
+}
+
+// OpenCodeJournalHighWater reads the current journal rowid without enumerating
+// sessions. The journal is an optimization; callers treat unsupported schemas
+// and read failures as reasons to wait for authoritative full sync.
+func OpenCodeJournalHighWater(
+	ctx context.Context, dbPath string,
+) (int64, bool, error) {
+	db, err := openOpenCodeDBContext(dbPath)
+	if err != nil {
+		return 0, false, err
+	}
+	defer db.Close()
+	supported, err := openCodeEventJournalSupported(ctx, db)
+	if err != nil || !supported {
+		return 0, supported, err
+	}
+	var high int64
+	if err := db.QueryRowContext(ctx,
+		"SELECT COALESCE(MAX(rowid), 0) FROM event",
+	).Scan(&high); err != nil {
+		return 0, true, fmt.Errorf("reading opencode journal high-water mark: %w", preferContextError(ctx, err))
+	}
+	return high, true, nil
+}
+
+// ReadOpenCodeJournal reads at most limit rows plus one overflow sentinel from
+// (afterRowID, currentHighRowID] in one read transaction.
+func ReadOpenCodeJournal(
+	ctx context.Context, dbPath string, afterRowID int64, limit int,
+) (OpenCodeJournalBatch, error) {
+	if err := ctx.Err(); err != nil {
+		return OpenCodeJournalBatch{}, err
+	}
+	if limit <= 0 {
+		return OpenCodeJournalBatch{}, fmt.Errorf("opencode journal limit must be positive")
+	}
+	db, err := openOpenCodeDBContext(dbPath)
+	if err != nil {
+		return OpenCodeJournalBatch{}, err
+	}
+	defer db.Close()
+	supported, err := openCodeEventJournalSupported(ctx, db)
+	if err != nil || !supported {
+		return OpenCodeJournalBatch{Supported: supported}, err
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return OpenCodeJournalBatch{}, fmt.Errorf("starting opencode journal read: %w", preferContextError(ctx, err))
+	}
+	defer func() { _ = tx.Rollback() }()
+	batch := OpenCodeJournalBatch{Supported: true, Safe: true}
+	if err := tx.QueryRowContext(ctx,
+		"SELECT COALESCE(MAX(rowid), 0) FROM event",
+	).Scan(&batch.HighRowID); err != nil {
+		return OpenCodeJournalBatch{}, fmt.Errorf("reading opencode journal high-water mark: %w", preferContextError(ctx, err))
+	}
+	if batch.HighRowID < afterRowID {
+		batch.Safe = false
+		return batch, nil
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT aggregate_id, type, data
+		FROM event
+		WHERE rowid > ? AND rowid <= ?
+		ORDER BY rowid
+		LIMIT ?
+	`, afterRowID, batch.HighRowID, limit+1)
+	if err != nil {
+		return OpenCodeJournalBatch{}, fmt.Errorf("listing opencode journal events: %w", preferContextError(ctx, err))
+	}
+	defer rows.Close()
+	rowsRead := 0
+	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return OpenCodeJournalBatch{}, err
+		}
+		if rowsRead == limit {
+			batch.Overflow = true
+			batch.Safe = false
+			break
+		}
+		rowsRead++
+		var aggregateID, eventType, data string
+		if err := rows.Scan(&aggregateID, &eventType, &data); err != nil {
+			return OpenCodeJournalBatch{}, fmt.Errorf("scanning opencode journal event: %w", err)
+		}
+		event, ok := interpretOpenCodeJournalEvent(aggregateID, eventType, data)
+		if !ok {
+			batch.Safe = false
+			continue
+		}
+		batch.Events = append(batch.Events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return OpenCodeJournalBatch{}, fmt.Errorf("listing opencode journal events: %w", preferContextError(ctx, err))
+	}
+	if err := tx.Commit(); err != nil {
+		return OpenCodeJournalBatch{}, fmt.Errorf("finishing opencode journal read: %w", preferContextError(ctx, err))
+	}
+	return batch, nil
+}
+
+func interpretOpenCodeJournalEvent(
+	aggregateID, eventType, data string,
+) (OpenCodeJournalEvent, bool) {
+	if !strings.HasPrefix(aggregateID, "ses_") || aggregateID == "ses_" || !json.Valid([]byte(data)) {
+		return OpenCodeJournalEvent{}, false
+	}
+	event := OpenCodeJournalEvent{SessionID: aggregateID}
+	switch {
+	case strings.HasPrefix(eventType, "session."):
+		event.Settlement = true
+	case eventType == "message.updated.1":
+		role := gjson.Get(data, "info.role").String()
+		completed := gjson.Get(data, "info.time.completed").Exists()
+		failed := gjson.Get(data, "info.error").Exists()
+		if role != "user" && role != "assistant" && role != "" {
+			return OpenCodeJournalEvent{}, false
+		}
+		event.Settlement = role == "user" || completed || failed
+	case eventType == "message.removed.1",
+		eventType == "message.part.updated.1",
+		eventType == "message.part.removed.1":
+		// Intermediate transcript mutation; wait for a settlement event.
+	default:
+		return OpenCodeJournalEvent{}, false
+	}
+	return event, true
+}
+
+// ListOpenCodeSessionMetaByID loads only selected session rows. Missing rows
+// are omitted so watcher-time source deletion never becomes archive deletion.
+func ListOpenCodeSessionMetaByID(
+	ctx context.Context, dbPath string, sessionIDs []string,
+) ([]OpenCodeSessionMeta, error) {
+	if len(sessionIDs) == 0 {
+		return nil, nil
+	}
+	db, err := openOpenCodeDBContext(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("starting opencode metadata read: %w", preferContextError(ctx, err))
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmt, err := tx.PrepareContext(ctx,
+		"SELECT time_updated FROM session WHERE id = ?",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("preparing opencode metadata read: %w", preferContextError(ctx, err))
+	}
+	defer stmt.Close()
+	metas := make([]OpenCodeSessionMeta, 0, len(sessionIDs))
+	for _, id := range sessionIDs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		var updated int64
+		err := stmt.QueryRowContext(ctx, id).Scan(&updated)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("reading opencode session metadata: %w", preferContextError(ctx, err))
+		}
+		metas = append(metas, OpenCodeSessionMeta{
+			SessionID: id, VirtualPath: dbPath + "#" + id,
+			FileMtime: updated * 1_000_000,
+		})
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("finishing opencode metadata read: %w", preferContextError(ctx, err))
+	}
+	return metas, nil
+}
+
 // OpenCodeSQLiteSessionExists reports whether a session row with
 // the given ID is present in the OpenCode SQLite database at
 // dbPath. Returns false when the file is missing, the schema is
@@ -245,8 +442,17 @@ func parseOpenCodeStorageFile(
 }
 
 func openOpenCodeDB(dbPath string) (*sql.DB, error) {
+	return openOpenCodeDBWithBusyTimeout(dbPath, 3000)
+}
+
+func openOpenCodeDBContext(dbPath string) (*sql.DB, error) {
+	// go-sqlite3 does not interrupt its native busy handler through Context.
+	return openOpenCodeDBWithBusyTimeout(dbPath, 100)
+}
+
+func openOpenCodeDBWithBusyTimeout(dbPath string, timeoutMS int) (*sql.DB, error) {
 	dsn := "file:" + sqliteURIPath(dbPath) +
-		"?mode=ro&_busy_timeout=3000"
+		fmt.Sprintf("?mode=ro&_busy_timeout=%d", timeoutMS)
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -254,6 +460,30 @@ func openOpenCodeDB(dbPath string) (*sql.DB, error) {
 		)
 	}
 	return db, nil
+}
+
+func preferContextError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return err
+}
+
+func openCodeEventJournalSupported(ctx context.Context, db *sql.DB) (bool, error) {
+	var tables, eventColumns, sequenceColumns int
+	err := db.QueryRowContext(ctx, `
+		SELECT
+			(SELECT COUNT(*) FROM sqlite_schema
+			 WHERE type = 'table' AND name IN ('event', 'event_sequence')),
+			(SELECT COUNT(*) FROM pragma_table_info('event')
+			 WHERE name IN ('id', 'aggregate_id', 'seq', 'type', 'data')),
+			(SELECT COUNT(*) FROM pragma_table_info('event_sequence')
+			 WHERE name IN ('aggregate_id', 'seq'))
+	`).Scan(&tables, &eventColumns, &sequenceColumns)
+	if err != nil {
+		return false, preferContextError(ctx, err)
+	}
+	return tables == 2 && eventColumns == 5 && sequenceColumns == 2, nil
 }
 
 // openCodeProject is a row from the opencode project table.

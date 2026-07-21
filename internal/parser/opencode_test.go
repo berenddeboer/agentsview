@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -75,6 +76,22 @@ CREATE TABLE part (
 	data TEXT NOT NULL,
 	FOREIGN KEY (message_id) REFERENCES message(id)
 );
+
+CREATE TABLE event_sequence (
+	aggregate_id TEXT PRIMARY KEY,
+	seq INTEGER NOT NULL
+);
+
+CREATE TABLE event (
+	id TEXT PRIMARY KEY,
+	aggregate_id TEXT NOT NULL,
+	seq INTEGER NOT NULL,
+	type TEXT NOT NULL,
+	data TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX event_aggregate_seq_idx
+	ON event (aggregate_id, seq);
 `
 
 func assertEq[T comparable](t *testing.T, name string, got, want T) {
@@ -121,6 +138,131 @@ func (s *OpenCodeSeeder) AddPart(id, messageID, sessionID string, timeCreated, t
 	_, err := s.db.Exec(`INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)`,
 		id, messageID, sessionID, timeCreated, timeUpdated, data)
 	require.NoError(s.t, err, "add part")
+}
+
+func (s *OpenCodeSeeder) AddEvent(
+	id, sessionID, eventType, data string, seq int,
+) {
+	s.t.Helper()
+	_, err := s.db.Exec(`
+		INSERT INTO event_sequence (aggregate_id, seq) VALUES (?, ?)
+		ON CONFLICT (aggregate_id) DO UPDATE SET seq = excluded.seq;
+		INSERT INTO event (id, aggregate_id, seq, type, data)
+		VALUES (?, ?, ?, ?, ?)
+	`, sessionID, seq, id, sessionID, seq, eventType, data)
+	require.NoError(s.t, err, "add event")
+}
+
+func TestReadOpenCodeJournalBoundedSettlement(t *testing.T) {
+	dbPath, seeder, writer := newTestDB(t)
+	defer writer.Close()
+	seeder.AddEvent("evt_1", "ses_stream", "message.part.updated.1", `{"time":1}`, 1)
+	seeder.AddEvent("evt_2", "ses_stream", "message.updated.1", `{"info":{"role":"assistant","time":{"completed":2}}}`, 2)
+	seeder.AddEvent("evt_3", "ses_other", "session.updated.1", `{"time":3}`, 1)
+
+	batch, err := ReadOpenCodeJournal(context.Background(), dbPath, 0, 2)
+	require.NoError(t, err)
+	assert.True(t, batch.Supported)
+	assert.False(t, batch.Safe)
+	assert.True(t, batch.Overflow)
+	assert.Equal(t, int64(3), batch.HighRowID)
+	require.Len(t, batch.Events, 2)
+	assert.False(t, batch.Events[0].Settlement)
+	assert.True(t, batch.Events[1].Settlement)
+
+	batch, err = ReadOpenCodeJournal(context.Background(), dbPath, 0, 3)
+	require.NoError(t, err)
+	assert.True(t, batch.Safe)
+	assert.False(t, batch.Overflow)
+	assert.Equal(t, []OpenCodeJournalEvent{
+		{SessionID: "ses_stream", Settlement: false},
+		{SessionID: "ses_stream", Settlement: true},
+		{SessionID: "ses_other", Settlement: true},
+	}, batch.Events)
+}
+
+func TestReadOpenCodeJournalRejectsUnrecognizedRows(t *testing.T) {
+	dbPath, seeder, writer := newTestDB(t)
+	defer writer.Close()
+	seeder.AddEvent("evt_1", "global", "project.updated.1", `{"time":1}`, 1)
+
+	batch, err := ReadOpenCodeJournal(context.Background(), dbPath, 0, 10)
+	require.NoError(t, err)
+	assert.True(t, batch.Supported)
+	assert.False(t, batch.Safe)
+	assert.Empty(t, batch.Events)
+}
+
+func TestOpenCodeJournalRejectsIncompatibleSchema(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "opencode.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	defer db.Close()
+	_, err = db.Exec(`
+		CREATE TABLE event (id TEXT PRIMARY KEY, payload TEXT);
+		CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER);
+	`)
+	require.NoError(t, err)
+
+	_, supported, err := OpenCodeJournalHighWater(context.Background(), dbPath)
+	require.NoError(t, err)
+	assert.False(t, supported)
+}
+
+func TestListOpenCodeSessionMetaByIDIsTargeted(t *testing.T) {
+	dbPath, seeder, writer := newTestDB(t)
+	defer writer.Close()
+	seeder.AddProject("prj", "/tmp/project")
+	for i := 0; i < 100; i++ {
+		seeder.AddSession(fmt.Sprintf("ses_%03d", i), "prj", "", "", 1, int64(i+1))
+	}
+
+	metas, err := ListOpenCodeSessionMetaByID(
+		context.Background(), dbPath, []string{"ses_042", "ses_missing"},
+	)
+	require.NoError(t, err)
+	require.Len(t, metas, 1)
+	assert.Equal(t, "ses_042", metas[0].SessionID)
+	assert.Equal(t, dbPath+"#ses_042", metas[0].VirtualPath)
+	assert.Equal(t, int64(43_000_000), metas[0].FileMtime)
+}
+
+func TestOpenCodeJournalWorkIsArchiveCardinalityIndependent(t *testing.T) {
+	for _, archiveSize := range []int{10, 5000} {
+		t.Run(fmt.Sprintf("sessions-%d", archiveSize), func(t *testing.T) {
+			dbPath, seeder, writer := newTestDB(t)
+			defer writer.Close()
+			seeder.AddProject("prj", "/tmp/project")
+			tx, err := writer.Begin()
+			require.NoError(t, err)
+			stmt, err := tx.Prepare(`
+				INSERT INTO session
+					(id, project_id, time_created, time_updated)
+				VALUES (?, 'prj', 1, 2)
+			`)
+			require.NoError(t, err)
+			for i := 0; i < archiveSize; i++ {
+				_, err = stmt.Exec(fmt.Sprintf("ses_%05d", i))
+				require.NoError(t, err)
+			}
+			require.NoError(t, stmt.Close())
+			require.NoError(t, tx.Commit())
+			seeder.AddEvent(
+				"evt_target", "ses_00000", "session.updated.1", `{"time":1}`, 1,
+			)
+
+			batch, err := ReadOpenCodeJournal(context.Background(), dbPath, 0, 10)
+			require.NoError(t, err)
+			require.True(t, batch.Safe)
+			require.Len(t, batch.Events, 1)
+			metas, err := ListOpenCodeSessionMetaByID(
+				context.Background(), dbPath, []string{batch.Events[0].SessionID},
+			)
+			require.NoError(t, err)
+			require.Len(t, metas, 1)
+			assert.Equal(t, "ses_00000", metas[0].SessionID)
+		})
+	}
 }
 
 func newTestDB(t *testing.T) (string, *OpenCodeSeeder, *sql.DB) {

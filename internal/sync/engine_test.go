@@ -50,6 +50,17 @@ func requireClassifyProviderChangedPath(
 	return files
 }
 
+func TestMergeChangedPathDiscoveredFilePreservesContentChange(t *testing.T) {
+	current := parser.SourceRef{Key: "session"}
+	next := parser.SourceRef{Key: "session", ContentChanged: true}
+	merged := mergeChangedPathDiscoveredFile(
+		parser.DiscoveredFile{ProviderSource: &current},
+		parser.DiscoveredFile{ProviderSource: &next},
+	)
+	require.NotNil(t, merged.ProviderSource)
+	assert.True(t, merged.ProviderSource.ContentChanged)
+}
+
 func TestClaudeIDFreshnessRejectsSourceMissingTombstone(t *testing.T) {
 	database := openTestDB(t)
 	root := t.TempDir()
@@ -7239,6 +7250,13 @@ func TestEngine_ClassifyPathsOpenCodeSQLiteWALFile(
 	require.NoError(t, err, "Stat(%q)", walPath)
 	require.Greater(t, walInfo.Size(), int64(32), "WAL must contain transaction frames")
 
+	// The first event establishes a disposable baseline and intentionally does
+	// not enumerate the existing container.
+	assert.Empty(t, requireClassifyPaths(t, engine, []string{walPath}))
+	addOpenCodeSQLiteTestEvent(
+		t, dbPath, "evt_002", "ses_wal", "message.updated.1",
+		`{"info":{"role":"user"}}`, 2,
+	)
 	files := requireClassifyPaths(t, engine, []string{walPath})
 	require.Len(t, files, 1)
 	assert.Equal(t,
@@ -7246,6 +7264,8 @@ func TestEngine_ClassifyPathsOpenCodeSQLiteWALFile(
 		files[0].Path,
 	)
 	assert.Equal(t, parser.AgentOpenCode, files[0].Agent)
+	require.NotNil(t, files[0].ProviderSource)
+	assert.True(t, files[0].ProviderSource.ContentChanged)
 }
 
 // seedOpenCodeSQLiteWALSession creates a minimal OpenCode-shaped SQLite
@@ -7280,6 +7300,19 @@ func seedOpenCodeSQLiteWALSession(t *testing.T, dbPath, sessionID string) {
 			data TEXT NOT NULL,
 			time_created INTEGER NOT NULL
 		);
+		CREATE TABLE event_sequence (
+			aggregate_id TEXT PRIMARY KEY,
+			seq INTEGER NOT NULL
+		);
+		CREATE TABLE event (
+			id TEXT PRIMARY KEY,
+			aggregate_id TEXT NOT NULL,
+			seq INTEGER NOT NULL,
+			type TEXT NOT NULL,
+			data TEXT NOT NULL
+		);
+		CREATE UNIQUE INDEX event_aggregate_seq_idx
+			ON event (aggregate_id, seq);
 	`)
 	require.NoError(t, err, "create opencode schema")
 	var journalMode string
@@ -7297,6 +7330,109 @@ func seedOpenCodeSQLiteWALSession(t *testing.T, dbPath, sessionID string) {
 		sessionID,
 	)
 	require.NoError(t, err, "insert session")
+	_, err = d.Exec(`
+		INSERT INTO message (id, session_id, data, time_created)
+		VALUES ('msg_1', ?, '{"role":"user"}', 1);
+		INSERT INTO part (id, session_id, message_id, data, time_created)
+		VALUES ('part_1', ?, 'msg_1', '{"type":"text","text":"hello"}', 1);
+		INSERT INTO event_sequence (aggregate_id, seq) VALUES (?, 1);
+		INSERT INTO event (id, aggregate_id, seq, type, data)
+		VALUES ('evt_001', ?, 1, 'session.created.1', '{"time":1}');
+	`, sessionID, sessionID, sessionID, sessionID)
+	require.NoError(t, err, "insert transcript and baseline event")
+}
+
+func addOpenCodeSQLiteTestEvent(
+	t *testing.T,
+	dbPath, eventID, sessionID, eventType, data string,
+	seq int,
+) {
+	t.Helper()
+	d, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	defer d.Close()
+	_, err = d.Exec(`
+		INSERT INTO event (id, aggregate_id, seq, type, data)
+		VALUES (?, ?, ?, ?, ?);
+		UPDATE event_sequence SET seq = ? WHERE aggregate_id = ?;
+	`, eventID, sessionID, seq, eventType, data, seq, sessionID)
+	require.NoError(t, err)
+}
+
+func TestOpenCodeWatchCoalescesIntermediateEvents(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "opencode.db")
+	seedOpenCodeSQLiteWALSession(t, dbPath, "ses_stream")
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenCode: {root}},
+	})
+
+	assert.Empty(t, engine.classifyPaths([]string{dbPath}))
+	addOpenCodeSQLiteTestEvent(
+		t, dbPath, "evt_002", "ses_stream", "message.part.updated.1",
+		`{"time":2}`, 2,
+	)
+	assert.Empty(t, engine.classifyPaths([]string{dbPath}))
+
+	engine.openCodeWatchMu.Lock()
+	_, pending := engine.openCodeWatch[dbPath].pending["ses_stream"]
+	engine.openCodeWatchMu.Unlock()
+	assert.True(t, pending)
+
+	addOpenCodeSQLiteTestEvent(
+		t, dbPath, "evt_003", "ses_stream", "message.updated.1",
+		`{"info":{"role":"assistant","time":{"completed":3}}}`, 3,
+	)
+	files := engine.classifyPaths([]string{dbPath})
+	require.Len(t, files, 1)
+	assert.Equal(t, parser.OpenCodeSQLiteVirtualPath(dbPath, "ses_stream"), files[0].Path)
+}
+
+func TestOpenCodeWatchJournalOverflowStaysBounded(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "opencode.db")
+	seedOpenCodeSQLiteWALSession(t, dbPath, "ses_overflow")
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenCode: {root}},
+	})
+	assert.Empty(t, engine.classifyPaths([]string{dbPath}))
+	for seq := 2; seq <= openCodeJournalBatchLimit+2; seq++ {
+		addOpenCodeSQLiteTestEvent(
+			t, dbPath, fmt.Sprintf("evt_%03d", seq), "ses_overflow",
+			"message.part.updated.1", `{"time":2}`, seq,
+		)
+	}
+	assert.Empty(t, engine.classifyPaths([]string{dbPath}))
+	engine.openCodeWatchMu.Lock()
+	state := engine.openCodeWatch[dbPath]
+	engine.openCodeWatchMu.Unlock()
+	assert.Empty(t, state.pending)
+	assert.Equal(t, int64(openCodeJournalBatchLimit+2), state.rowID)
+}
+
+func TestOpenCodeWatchPendingOverflowClearsState(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "opencode.db")
+	seedOpenCodeSQLiteWALSession(t, dbPath, "ses_initial")
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenCode: {root}},
+	})
+	assert.Empty(t, engine.classifyPaths([]string{dbPath}))
+	for i := 0; i <= openCodePendingLimit; i++ {
+		addOpenCodeSQLiteTestEvent(
+			t, dbPath, fmt.Sprintf("evt-pending-%03d", i),
+			fmt.Sprintf("ses_pending_%03d", i), "message.part.updated.1",
+			`{"time":2}`, 1,
+		)
+	}
+	assert.Empty(t, engine.classifyPaths([]string{dbPath}))
+	engine.openCodeWatchMu.Lock()
+	state := engine.openCodeWatch[dbPath]
+	engine.openCodeWatchMu.Unlock()
+	assert.Empty(t, state.pending)
 }
 
 func TestEngine_ClassifyPathsOpenCodeRemovedMessageFile(

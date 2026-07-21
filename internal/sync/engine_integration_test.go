@@ -722,6 +722,63 @@ func TestSyncEngineOpenCodeSQLiteSameMtimeContentChangeUsesFingerprint(
 		"successful rewrite must bump local_modified_at for push windows")
 }
 
+func TestSyncEngineOpenCodeJournalDefersStreamingUntilSettlement(
+	t *testing.T,
+) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	oc := createOpenCodeDB(t, env.opencodeDir)
+	oc.addProject(t, "proj", "/home/user/code/opencode-app")
+	seedOpenCodeSQLiteTextSession(
+		t, oc, "proj", "ses_stream",
+		1779012000000, 1779012030000,
+		"original prompt", "original answer",
+	)
+
+	stats := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted)
+	require.Equal(t, 1, stats.Synced)
+	sessionID := "opencode:ses_stream"
+	before := openCodeStoredSession(t, env.db, sessionID)
+	require.NotNil(t, before.LocalModifiedAt)
+
+	oc.replaceTextContent(
+		t, "ses_stream", "streamed prompt", "streamed answer",
+		1779012000000,
+	)
+	oc.addEvent(
+		t, "evt_001", "ses_stream", "message.part.updated.1",
+		`{"time":1}`, 1,
+	)
+	env.engine.SyncPaths([]string{oc.path})
+	assertMessageContent(
+		t, env.db, sessionID, "original prompt", "original answer",
+	)
+
+	oc.addEvent(
+		t, "evt_002", "ses_stream", "message.updated.1",
+		`{"info":{"role":"assistant","time":{"completed":2}}}`, 2,
+	)
+	time.Sleep(20 * time.Millisecond)
+	env.engine.SyncPaths([]string{oc.path})
+	assertMessageContent(
+		t, env.db, sessionID, "streamed prompt", "streamed answer",
+	)
+	after := openCodeStoredSession(t, env.db, sessionID)
+	require.NotNil(t, after.LocalModifiedAt)
+	assert.Greater(t, *after.LocalModifiedAt, *before.LocalModifiedAt)
+
+	// A settlement can select a source whose normalized content is unchanged;
+	// the post-parse fingerprint gate must still prevent an archive rewrite.
+	oc.addEvent(
+		t, "evt_003", "ses_stream", "session.updated.1", `{"time":3}`, 3,
+	)
+	time.Sleep(20 * time.Millisecond)
+	env.engine.SyncPaths([]string{oc.path})
+	unchanged := openCodeStoredSession(t, env.db, sessionID)
+	require.NotNil(t, unchanged.LocalModifiedAt)
+	assert.Equal(t, *after.LocalModifiedAt, *unchanged.LocalModifiedAt)
+}
+
 // TestSyncEngineOpenCodeSQLiteUntouchedContainerSkipsReparse pins the
 // container-level freshness gate: when the shared opencode.db file is
 // completely untouched since the last verified sync, its sessions must be
@@ -6313,27 +6370,27 @@ func TestOpenCodeSQLiteRootSyncPathsAndStaleReparse(t *testing.T) {
 		return assistantMessageID
 	}
 
-	syncPathsID := "oc-sqlite-sync-paths"
+	syncPathsID := "ses_sqlite_sync_paths"
 	seedTextSession(
 		syncPathsID,
 		"original sqlite question", "original sqlite answer", 0,
 	)
-	staleVersionID := "oc-sqlite-stale-version"
+	staleVersionID := "ses_sqlite_stale_version"
 	staleAssistantMessageID := seedTextSession(
 		staleVersionID,
 		"stale version question", "stale version answer", 10,
 	)
-	sourceMtimeID := "oc-source-sqlite"
+	sourceMtimeID := "ses_source_sqlite"
 	seedTextSession(
 		sourceMtimeID,
 		"source mtime question", "source mtime answer", 20,
 	)
-	goodSessionID := "oc-sqlite-watch-good"
+	goodSessionID := "ses_sqlite_watch_good"
 	seedTextSession(
 		goodSessionID,
 		"good original question", "good original answer", 30,
 	)
-	badSessionID := "oc-sqlite-watch-bad"
+	badSessionID := "ses_sqlite_watch_bad"
 	seedTextSession(
 		badSessionID,
 		"bad original question", "", 40,
@@ -6360,6 +6417,9 @@ func TestOpenCodeSQLiteRootSyncPathsAndStaleReparse(t *testing.T) {
 		timeCreated,
 	)
 	oc.updateSessionTime(t, syncPathsID, timeUpdated+1000)
+	oc.addEvent(
+		t, "evt-sync-paths", syncPathsID, "session.updated.1", `{"time":1}`, 1,
+	)
 
 	env.engine.SyncPaths([]string{oc.path})
 
@@ -6397,6 +6457,12 @@ func TestOpenCodeSQLiteRootSyncPathsAndStaleReparse(t *testing.T) {
 		t, "corrupt bad session message time",
 		"UPDATE message SET time_created = ? WHERE id = ?",
 		"broken-time", badSessionID+"-msg-u1",
+	)
+	oc.addEvent(
+		t, "evt-good", goodSessionID, "session.updated.1", `{"time":2}`, 1,
+	)
+	oc.addEvent(
+		t, "evt-bad", badSessionID, "session.updated.1", `{"time":2}`, 1,
 	)
 
 	env.engine.SyncPaths([]string{oc.path})
@@ -6484,7 +6550,7 @@ func TestSyncPathsOpenCodeSQLiteDBEventIgnoresStaleSkipCache(
 	oc := createOpenCodeDB(t, env.opencodeDir)
 	oc.addProject(t, "proj-1", "/home/user/code/myapp")
 
-	sessionID := "oc-sqlite-sync-paths-skip-cache"
+	sessionID := "ses_sqlite_sync_paths_skip_cache"
 	timeCreated := int64(1704067200000)
 	timeUpdated := int64(1704067205000)
 
@@ -6527,6 +6593,9 @@ func TestSyncPathsOpenCodeSQLiteDBEventIgnoresStaleSkipCache(
 		timeCreated,
 	)
 	oc.updateSessionTime(t, sessionID, timeUpdated+1000)
+	oc.addEvent(
+		t, "evt-skip-cache", sessionID, "session.updated.1", `{"time":1}`, 1,
+	)
 	require.NoError(t, os.Chtimes(oc.path, cachedMtime, cachedMtime), "restore db mtime")
 
 	env.engine.SyncPaths([]string{oc.path})
@@ -6829,7 +6898,7 @@ func TestOpenCodeHybridRootSyncsSQLiteSessions(t *testing.T) {
 		"storage reply", 1704067201000,
 	)
 
-	const duplicateID = "oc-hybrid-dup"
+	const duplicateID = "ses_hybrid_dup"
 	storage.addSession(
 		t, "global", duplicateID,
 		"/home/user/code/storage-app", "Hybrid Dup",
@@ -6847,7 +6916,7 @@ func TestOpenCodeHybridRootSyncsSQLiteSessions(t *testing.T) {
 	sqlite := createOpenCodeDB(t, env.opencodeDir)
 	sqlite.addProject(t, "proj-1", "/home/user/code/sqlite-app")
 	sqlite.addProject(t, "proj-2", "/home/user/code/storage-app")
-	sessionID := "oc-hybrid-sqlite"
+	sessionID := "ses_hybrid_sqlite"
 	timeCreated := int64(1704067200000)
 	timeUpdated := int64(1704067205000)
 	sqlite.addSession(
@@ -6926,6 +6995,9 @@ func TestOpenCodeHybridRootSyncsSQLiteSessions(t *testing.T) {
 		timeCreated,
 	)
 	sqlite.updateSessionTime(t, sessionID, timeUpdated+1000)
+	sqlite.addEvent(
+		t, "evt-hybrid-sqlite", sessionID, "session.updated.1", `{"time":1}`, 1,
+	)
 	env.engine.SyncPaths([]string{sqlite.path})
 	assertMessageContent(
 		t, env.db, "opencode:"+sessionID,
@@ -6954,10 +7026,36 @@ func TestOpenCodeHybridRootSyncsSQLiteSessions(t *testing.T) {
 		timeCreated,
 	)
 	sqlite.updateSessionTime(t, duplicateID, duplicateUpdated+1000)
+	sqlite.addEvent(
+		t, "evt-hybrid-duplicate", duplicateID, "session.updated.1", `{"time":1}`, 1,
+	)
 	env.engine.SyncPaths([]string{sqlite.path})
 	assertMessageContent(
 		t, env.db, "opencode:"+duplicateID,
 		"canonical storage reply",
+	)
+
+	const newSessionID = "ses_hybrid_new"
+	sqlite.addSession(t, newSessionID, "proj-1", timeCreated, timeUpdated)
+	sqlite.addMessage(t, "new-msg-u1", newSessionID, "user", timeCreated)
+	sqlite.addTextPart(
+		t, "new-part-u1", newSessionID, "new-msg-u1",
+		"new hybrid question", timeCreated,
+	)
+	sqlite.addEvent(
+		t, "evt-hybrid-new", newSessionID, "session.created.1", `{"time":1}`, 1,
+	)
+	env.engine.SyncPaths([]string{sqlite.path})
+	newSession, err := env.db.GetSession(
+		context.Background(), "opencode:"+newSessionID,
+	)
+	require.NoError(t, err)
+	assert.Nil(t, newSession, "unknown hybrid sessions wait for full discovery")
+
+	stats := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted)
+	assertMessageContent(
+		t, env.db, "opencode:"+newSessionID, "new hybrid question",
 	)
 }
 

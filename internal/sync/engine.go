@@ -288,6 +288,8 @@ type Engine struct {
 	providerMigrationModes  map[parser.AgentType]parser.ProviderMigrationMode
 	providerWatchRootsMu    gosync.Mutex
 	providerWatchRoots      map[parser.AgentType][]parser.WatchRoot
+	openCodeWatchMu         gosync.Mutex
+	openCodeWatch           map[string]openCodeWatchState
 	projectIdentityMu       gosync.Mutex
 	projectIdentityCache    map[string]projectIdentityCacheEntry
 	projectIdentityWritten  map[string]struct{}
@@ -499,6 +501,7 @@ func NewEngine(
 		providerFactories:       providerFactoryMap(providerFactories),
 		providerMigrationModes:  providerModes,
 		providerWatchRoots:      make(map[parser.AgentType][]parser.WatchRoot),
+		openCodeWatch:           make(map[string]openCodeWatchState),
 		projectIdentityCache:    make(map[string]projectIdentityCacheEntry),
 		projectIdentityWritten:  make(map[string]struct{}),
 		startupMaintenanceReady: make(chan struct{}),
@@ -913,6 +916,9 @@ func (e *Engine) classifyPaths(
 	files := make([]parser.DiscoveredFile, 0, len(paths))
 	var classificationErr error
 	for _, p := range paths {
+		if ctx.Err() != nil {
+			break
+		}
 		// Codex resolved-index events map to potentially several session
 		// sources and must classify even when the event path was deleted, so
 		// they are handled by classifyCodexIndexPath. All other changed paths,
@@ -955,6 +961,11 @@ func mergeChangedPathDiscoveredFile(
 	}
 	if current.ProviderSource == nil && next.ProviderSource != nil {
 		current.ProviderSource = next.ProviderSource
+	} else if current.ProviderSource != nil && next.ProviderSource != nil &&
+		next.ProviderSource.ContentChanged && !current.ProviderSource.ContentChanged {
+		merged := *current.ProviderSource
+		merged.ContentChanged = true
+		current.ProviderSource = &merged
 	}
 	return current
 }
@@ -977,6 +988,9 @@ func (e *Engine) classifyProviderChangedPath(
 	})
 
 	for _, agentType := range agents {
+		if ctx.Err() != nil {
+			return files
+		}
 		mode := e.providerMigrationModes[agentType]
 		switch mode {
 		case parser.ProviderMigrationProviderAuthoritative:
@@ -1032,6 +1046,9 @@ func (e *Engine) classifyProviderChangedPath(
 			continue
 		}
 		for _, watchRoot := range watchRoots {
+			if ctx.Err() != nil {
+				return files, classificationErr
+			}
 			request := parser.ChangedPathRequest{
 				Path:      path,
 				EventKind: eventKind,
@@ -1060,11 +1077,21 @@ func (e *Engine) classifyProviderChangedPath(
 					}
 				}
 			}
-			sources, err := provider.SourcesForChangedPath(
-				ctx,
-				request,
+			var (
+				sources []parser.SourceRef
+				srcErr  error
+				handled bool
 			)
-			if err != nil {
+			if agentType == parser.AgentOpenCode {
+				sources, handled = e.classifyOpenCodeJournalPath(
+					ctx, path, watchRoot, provider,
+				)
+			}
+			if !handled {
+				sources, srcErr = provider.SourcesForChangedPath(ctx, request)
+			}
+			if srcErr != nil {
+				err = srcErr
 				if !errors.Is(err, parser.ErrUnsupportedProviderFeature) {
 					classificationErr = errors.Join(
 						classificationErr,
@@ -4724,6 +4751,9 @@ func (e *Engine) syncAllLocked(
 	if recordSyncState && stats.providerFailures == 0 {
 		e.recordSyncFinished()
 	}
+	if scope == nil && since.IsZero() && providerFailures == 0 && stats.Failed == 0 {
+		e.rebaselineOpenCodeWatch(ctx)
+	}
 	// Emission happens in SyncAll / SyncAllSince after syncMu is
 	// released; syncAllLocked runs under the caller's lock.
 	return stats
@@ -6783,6 +6813,7 @@ func (e *Engine) processProviderFile(
 	ctx context.Context,
 	file parser.DiscoveredFile,
 ) (processResult, bool) {
+	contentChanged := file.ProviderSource != nil && file.ProviderSource.ContentChanged
 	mode := e.providerMigrationModes[file.Agent]
 	usesProvider := processFileUsesProvider(file.Agent)
 	if mode != parser.ProviderMigrationProviderAuthoritative && !usesProvider {
@@ -6802,7 +6833,7 @@ func (e *Engine) processProviderFile(
 	// provably has not changed since the last fully verified pass, none
 	// of its sessions can have changed, so skip before paying for the
 	// per-session fingerprint (a DB open per source) and parse.
-	if e.sqliteContainerSourceFresh(file) {
+	if !contentChanged && e.sqliteContainerSourceFresh(file) {
 		return processResult{skip: true}, true
 	}
 
@@ -6866,7 +6897,7 @@ func (e *Engine) processProviderFile(
 
 	verifiedCapture, verifiedMtime, verifiedFresh, verifiedStateOK :=
 		e.verifiedProviderSourceState(provider, source, file)
-	if verifiedStateOK && verifiedFresh {
+	if !contentChanged && verifiedStateOK && verifiedFresh {
 		if e.verifiedProviderSourceFreshInDB(
 			source, verifiedCapture.signature.size, verifiedMtime,
 		) {
@@ -6887,7 +6918,7 @@ func (e *Engine) processProviderFile(
 	sourceForceReplace := false
 	if mtime, fresh, forceReplace, contentVerified := e.providerSingleSessionFresh(
 		ctx, provider, source, file,
-	); fresh {
+	); fresh && !contentChanged {
 		if !verifiedStateOK || contentVerified {
 			if verifiedStateOK {
 				e.promoteVerifiedSource(verifiedCapture)
@@ -6904,7 +6935,7 @@ func (e *Engine) processProviderFile(
 	} else if forceReplace {
 		sourceForceReplace = true
 	}
-	if freshMtime, fresh := e.providerSourceFreshBeforeFingerprint(source, file); fresh {
+	if freshMtime, fresh := e.providerSourceFreshBeforeFingerprint(source, file); fresh && !contentChanged {
 		return processResult{
 			skip:  true,
 			mtime: freshMtime,
@@ -6928,7 +6959,7 @@ func (e *Engine) processProviderFile(
 	}
 	cacheKey := providerProcessCacheKey(file, source, fingerprint)
 	cacheSkip := e.shouldCacheSkip(file)
-	if cacheSkip && !e.forceParse && !file.ForceParse {
+	if cacheSkip && !contentChanged && !e.forceParse && !file.ForceParse {
 		e.skipMu.RLock()
 		cachedMtime, cached := e.skipCache[cacheKey]
 		e.skipMu.RUnlock()
@@ -6962,7 +6993,7 @@ func (e *Engine) processProviderFile(
 			}
 		}
 	}
-	if cacheSkip && e.shouldSkipProviderSource(file, source, fingerprint) {
+	if cacheSkip && !contentChanged && e.shouldSkipProviderSource(file, source, fingerprint) {
 		return processResult{
 			skip:      true,
 			mtime:     fingerprint.MTimeNS,
@@ -6994,7 +7025,7 @@ func (e *Engine) processProviderFile(
 	// engine). For Codex this also folds in the session_index.jsonl sidecar:
 	// a shared index mtime bump that did not change this session's title must
 	// not trigger a reparse.
-	if !incForceReplace && !e.forceParse && !file.ForceParse &&
+	if !contentChanged && !incForceReplace && !e.forceParse && !file.ForceParse &&
 		e.shouldSkipProviderSourceByDB(file, fingerprint) {
 		if verifiedStateOK {
 			e.promoteVerifiedSource(verifiedCapture)
@@ -7018,7 +7049,7 @@ func (e *Engine) processProviderFile(
 	// a provider whose fingerprint mtime differs from the stored value simply
 	// reparses, matching the prior behavior. Claude and Cowork have their own
 	// earlier freshness checks; this is the generic fallback for the rest.
-	if !incForceReplace && !e.forceParse && !file.ForceParse &&
+	if !contentChanged && !incForceReplace && !e.forceParse && !file.ForceParse &&
 		e.providerSourceUnchangedInDB(source, fingerprint) {
 		return processResult{
 			skip:      true,
