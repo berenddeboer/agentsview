@@ -7,6 +7,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -148,6 +149,12 @@ func TestPGSearchContentSubstringMessages(t *testing.T) {
 	assert.Equal(t, 0, m.Ordinal)
 	assert.Equal(t, "user", m.Role)
 	assert.NotEmpty(t, m.Snippet)
+	parsed, err := time.Parse(time.RFC3339Nano, m.Timestamp)
+	require.NoError(t, err, "match timestamp must be RFC3339Nano, got %q", m.Timestamp)
+	want, err := time.Parse(time.RFC3339Nano, "2026-05-01T10:00:00Z")
+	require.NoError(t, err)
+	assert.True(t, want.Equal(parsed),
+		"match timestamp must equal the inserted instant, want %v got %v", want, parsed)
 }
 
 // TestPGSearchContentRedactsStraddlingSecret pins the PG default (non-reveal)

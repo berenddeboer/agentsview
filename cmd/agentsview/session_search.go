@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/mattn/go-runewidth"
 	"github.com/spf13/cobra"
@@ -194,14 +195,39 @@ func resolveContentSearchMode(
 // printContentSearchResult renders a content search result for humans.
 // Flat results (no --context) render as an aligned table sized to the
 // terminal; --context requests keep the record-style output because
-// per-match context lines cannot live inside table rows.
+// per-match context lines cannot live inside table rows. The clock is
+// captured once here and threaded into the row loop so tests can inject a
+// fixed time.
 func printContentSearchResult(
 	w io.Writer, res *service.ContentSearchResult, contextN int,
 ) error {
+	now := time.Now()
 	if contextN > 0 {
-		return printContentMatchesHuman(w, res)
+		return printContentMatchesHuman(w, res, now)
 	}
-	return printContentMatchesTable(w, res, contentTerminalWidth(w))
+	return printContentMatchesTable(w, res, contentTerminalWidth(w), now)
+}
+
+// humanizeMatchAge renders a content match's timestamp for the search AGE
+// column. It parses the RFC3339/RFC3339Nano string via parseSessionTime
+// (returning emDash when empty or unparseable), uses the shared relative
+// buckets under a week, and beyond a week formats an absolute date that
+// disambiguates the year: "Jan 02" when the timestamp falls in now's year,
+// "Jan 2006" (e.g. "Jan 2025") for prior years. Search spans the whole
+// multi-year archive, so the year matters here even though session list omits
+// it.
+func humanizeMatchAge(ts string, now time.Time) string {
+	t, ok := parseSessionTime(ts)
+	if !ok {
+		return emDash
+	}
+	if rel, ok := humanizeAgeRelative(t, now); ok {
+		return rel
+	}
+	if t.Year() == now.Year() {
+		return t.Format("Jan 02")
+	}
+	return t.Format("Jan 2006")
 }
 
 // contentTerminalWidth reports the terminal width of w, or 0 when w is not
@@ -270,12 +296,13 @@ func contentSnippetBudget(termWidth int, otherWidths []int) int {
 }
 
 // printContentMatchesTable writes one aligned row per match under a header
-// line: ID, MATCH (ordinal/range plus "sub" marker), SCORE (only when any
+// line: ID, MATCH (ordinal/range plus "sub" marker), AGE (relative bucket or
+// absolute date, em dash when unknown), SCORE (only when any
 // match is scored), PROJECT (capped), LOCATION (capped), and SNIPPET. The snippet
 // expands to fill the remaining terminal width when termWidth is known and
 // prints untruncated when it is 0. Every cell is terminal-sanitized.
 func printContentMatchesTable(
-	w io.Writer, res *service.ContentSearchResult, termWidth int,
+	w io.Writer, res *service.ContentSearchResult, termWidth int, now time.Time,
 ) error {
 	if len(res.Matches) == 0 {
 		fmt.Fprintln(w, "(no matches)")
@@ -288,7 +315,7 @@ func printContentMatchesTable(
 			break
 		}
 	}
-	headers := []string{"ID", "MATCH"}
+	headers := []string{"ID", "MATCH", "AGE"}
 	if hasScore {
 		headers = append(headers, "SCORE")
 	}
@@ -312,7 +339,9 @@ func printContentMatchesTable(
 		if m.Subordinate {
 			match += " sub"
 		}
-		cells := []string{sanitizeTerminal(m.SessionID), match}
+		cells := []string{
+			sanitizeTerminal(m.SessionID), match, humanizeMatchAge(m.Timestamp, now),
+		}
 		if hasScore {
 			score := emDash
 			if m.Score != nil {
@@ -378,7 +407,7 @@ func printContentMatchesTable(
 // plain "#<ordinal>", and a subordinate unit gains a "sub" marker. When
 // --context requested inline context, ContextBefore/ContextAfter print as
 // indented "role: content" lines around the match line.
-func printContentMatchesHuman(w io.Writer, res *service.ContentSearchResult) error {
+func printContentMatchesHuman(w io.Writer, res *service.ContentSearchResult, now time.Time) error {
 	if len(res.Matches) == 0 {
 		fmt.Fprintln(w, "(no matches)")
 		return nil
@@ -398,7 +427,8 @@ func printContentMatchesHuman(w io.Writer, res *service.ContentSearchResult) err
 		if m.Score != nil {
 			fmt.Fprintf(w, " score=%.2f", *m.Score)
 		}
-		fmt.Fprintf(w, "  %s  %s\n",
+		fmt.Fprintf(w, "  %s  %s  %s\n",
+			humanizeMatchAge(m.Timestamp, now),
 			sanitizeTerminal(m.Project), sanitizeTerminal(loc))
 		fmt.Fprintf(w, "    %s\n",
 			sanitizeTerminal(strings.ReplaceAll(m.Snippet, "\n", " ")))
