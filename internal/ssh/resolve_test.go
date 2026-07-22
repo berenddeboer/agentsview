@@ -660,3 +660,49 @@ func TestResolveScriptRooCodeSkipsRootWithoutSessions(t *testing.T) {
 			"a session-less RooCode root must emit nothing")
 	}
 }
+
+func TestResolveScriptKiloLegacyRejectsSymlinkedTaskDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	home := t.TempDir()
+	klRoot := filepath.Join(home, ".config", "Code", "User",
+		"globalStorage", "kilocode.kilo-code")
+	tasksDir := filepath.Join(klRoot, "tasks")
+	require.NoError(t, os.MkdirAll(tasksDir, 0o755))
+
+	// Real task directory with metadata.
+	realTask := filepath.Join(tasksDir, "real-task")
+	require.NoError(t, os.MkdirAll(realTask, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(realTask, "task_metadata.json"),
+		[]byte(`{}`), 0o644,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(realTask, "ui_messages.json"),
+		[]byte(`[]`), 0o644,
+	))
+
+	// Symlinked task directory pointing outside root.
+	outsideDir := filepath.Join(t.TempDir(), "escaped-task")
+	require.NoError(t, os.MkdirAll(outsideDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(outsideDir, "task_metadata.json"),
+		[]byte(`{}`), 0o644,
+	))
+	symlinkTask := filepath.Join(tasksDir, "symlink-task")
+	require.NoError(t, os.Symlink(outsideDir, symlinkTask))
+
+	out := runResolveScriptForTest(t, "HOME="+home)
+
+	records := resolveOutputRecords(string(out))
+	agentFilePrefix := resolveAgentFilePrefix + ":" + string(parser.AgentKiloLegacy)
+	// Real task files should be emitted.
+	assert.True(t, hasRecordWithPathSuffix(records, agentFilePrefix,
+		"tasks/real-task/task_metadata.json"),
+		"real task metadata should be emitted")
+	// Symlinked task files must not be emitted.
+	assert.False(t, hasRecordWithPathSuffix(records, agentFilePrefix,
+		"tasks/symlink-task/task_metadata.json"),
+		"symlinked task files must be rejected")
+}

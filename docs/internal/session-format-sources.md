@@ -233,6 +233,31 @@ Grok section and remove the explicit registry exception in the coverage test.
   Kilo migrations mean the pinned current source must be compared with legacy
   fixtures when changing compatibility.
 
+## Kilo (legacy) (`kilo-legacy`)
+
+- **Format:** Pre-OpenCode Kilo VSCode extension (`kilocode.kilo-code`) task
+  directories under VSCode `globalStorage`. Each session holds
+  `task_metadata.json` (files-in-context only), the Claude-shaped
+  `api_conversation_history.json`, and the Cline-shaped `ui_messages.json`.
+- **Evidence:** `source`.
+- **Upstream:** Clone `https://github.com/Kilo-Org/kilocode.git` at
+  `938919ab72e3977d1512e0363417270e3337c7b1`. The pinned
+  [task persistence](https://github.com/Kilo-Org/kilocode/blob/938919ab72e3977d1512e0363417270e3337c7b1/src/core/task-persistence/TaskHistoryStore.ts)
+  and
+  [UI message reader](https://github.com/Kilo-Org/kilocode/blob/938919ab72e3977d1512e0363417270e3337c7b1/src/core/task-persistence/taskMessages.ts)
+  own the Cline-shaped transcript. The extension was superseded by the
+  OpenCode-based rebuild (public beta 2026-03-10, GA 2026-04-02); new sessions
+  stopped appearing around 2026-03-21.
+- **Usage and cost:** `ui_messages.json` carries per-request `api_req_started`
+  metadata with input, output, cache-read, and cache-write tokens, explicit USD
+  cost, and `usageMissing` flag. `task_metadata.json` does not carry the
+  RooCode-style ID/token/cost wiring; token and cost totals are derived from
+  the transcript itself.
+- **Agentsview:** `internal/parser/kilo_legacy.go` and
+  `internal/parser/kilo_legacy_provider.go`; the parser borrows RooCode's
+  Cline message handling (tool-call pairing, reasoning, compact boundaries,
+  error linking). New sessions stopped after the OpenCode migration.
+
 ## Roo Code (`roocode`)
 
 - **Format:** One task directory per session with `history_item.json` metadata

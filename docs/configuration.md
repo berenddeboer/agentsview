@@ -256,6 +256,7 @@ can still be parsed.
 | Kimi                  | `~/.kimi/sessions/` and `~/.kimi-code/sessions/`                                 | JSONL per session                                                                                                               |
 | Kiro CLI              | `~/.kiro/sessions/cli/` and `~/.local/share/kiro-cli/`                           | JSONL per session and SQLite database                                                                                           |
 | Kiro IDE              | (platform-specific, see below)                                                   | JSON / chat files                                                                                                               |
+| Kilo (legacy)         | (platform-specific, see below)                                                   | `tasks/<uuid>/{task_metadata.json,ui_messages.json,api_conversation_history.json}`                                              |
 | MiMoCode              | `~/.local/share/mimocode/`                                                       | SQLite DB or `storage/` JSON files                                                                                              |
 | Mistral Vibe          | `~/.vibe/logs/session/`                                                          | Per-session `messages.jsonl` plus `meta.json`                                                                                   |
 | OhMyPi                | `~/.omp/agent/sessions/`                                                         | JSONL per session                                                                                                               |
@@ -461,6 +462,35 @@ RooCode was shut down on May 15, 2026. ZooCode (Zoo-CodeInc.zoo-cline) is the
 active community fork and will be supported separately. Set `ROOCODE_DIR` or
 `roocode_dirs` if your VSCode globalStorage directory is elsewhere.
 
+**Kilo (legacy) default directories** vary by platform, all rooted at the
+canonical lowercase `kilocode.kilo-code` global storage directory that VSCode
+writes on disk:
+
+- **macOS:** `~/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code/`
+- **Linux:** `~/.config/Code/User/globalStorage/kilocode.kilo-code/`
+- **Windows:** `%APPDATA%/Code/User/globalStorage/kilocode.kilo-code/`
+
+Each `<root>/tasks/<uuid>/` task directory carries three JSON files:
+`task_metadata.json` (only stores `files_in_context`), the Claude-shaped
+`api_conversation_history.json`, and the Cline-shaped `ui_messages.json`.
+AgentsView folds the latter two into a composite fingerprint with
+`task_metadata.json` as the source anchor so changes to any of the three trigger
+a reparse. Sessions are parsed through RooCode-descended Cline message handling
+(tool-call and result pairing, reasoning pipeline, compact boundaries, error
+linking). Set `KILO_LEGACY_DIR` or `kilo_legacy_dirs` when the legacy extension
+stores its data outside the standard locations.
+
+**Kilo (legacy) vs Kilo.** These are two different agents. *Kilo* (the
+`kilo` agent) is the OpenCode-based core at `~/.local/share/kilo/`; it
+covers both the Kilo CLI and the rebuilt Kilo Code VS Code extension,
+which share that same `kilo.db`. *Kilo (legacy)* (the `kilo-legacy` agent)
+is the legacy RooCode-derived VS Code extension that wrote per-task JSON
+under `kilocode.kilo-code/tasks/` and stopped receiving new sessions after
+Kilo rebuilt the extension on OpenCode (public beta 2026-03-10, GA
+2026-04-02). The `kilo-legacy` agent is frozen at that legacy format and
+only archives older sessions; newer Kilo VS Code activity appears under
+`kilo`.
+
 **Antigravity CLI transcript sources:** Antigravity CLI has used both SQLite
 databases and AES-encrypted `.pb` files. AgentsView reads whichever source is
 richest, in this order:
@@ -532,6 +562,7 @@ export KILO_DIR=~/custom/kilo
 export KIMI_DIR=~/custom/kimi
 export KIRO_SESSIONS_DIR=~/custom/kiro
 export KIRO_IDE_DIR=~/custom/kiro-ide
+export KILO_LEGACY_DIR=~/custom/kilo-legacy
 export MIMOCODE_DIR=~/custom/mimocode
 export VIBE_SESSIONS_DIR=~/custom/vibe/logs/session
 export OMP_DIR=~/custom/omp
@@ -580,8 +611,7 @@ The corresponding fields are `aider_dirs`, `amp_dirs`, `antigravity_dirs`,
 `cowork_dirs`, `devin_dirs`, `codex_sessions_dirs`, `commandcode_project_dirs`,
 `copilot_dirs`, `cortex_dirs`, `cursor_project_dirs`,
 `deepseek_tui_sessions_dirs`, `forge_dirs`, `gemini_dirs`, `gptme_dirs`,
-`grok_dirs`, `hermes_sessions_dirs`, `iflow_dirs`, `kilo_dirs`, `kimi_dirs`,
-`kiro_dirs`, `kiro_ide_dirs`, `mimocode_dirs`, `vibe_session_dirs`,
+`grok_dirs`, `hermes_sessions_dirs`, `iflow_dirs`, `kilo_dirs`, `kilo_legacy_dirs`, `kimi_dirs`, `kiro_dirs`, `kiro_ide_dirs`, `mimocode_dirs`, `vibe_session_dirs`,
 `omp_dirs`, `openclaw_dirs`, `opencode_dirs`, `openhands_dirs`, `pi_dirs`,
 `piebald_dirs`, `posit_assistant_dirs`, `positron_dirs`, `qclaw_dirs`,
 `qoder_project_dirs`, `qwen_project_dirs`, `qwenpaw_dirs`, `reasonix_dirs`, `roocode_dirs`,

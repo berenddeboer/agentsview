@@ -462,6 +462,8 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newKiroIDEProviderFactory(def)
 	case AgentKilo:
 		return newKiloProviderFactory(def)
+	case AgentKiloLegacy:
+		return newKiloLegacyProviderFactory(def)
 	case AgentMiMoCode:
 		return newMiMoCodeProviderFactory(def)
 	case AgentIcodemate:

@@ -19,6 +19,7 @@ const (
 	AgentMiMoCode       AgentType = "mimocode"
 	AgentOpenCode       AgentType = "opencode"
 	AgentKilo           AgentType = "kilo"
+	AgentKiloLegacy     AgentType = "kilo-legacy"
 	AgentOpenHands      AgentType = "openhands"
 	AgentCursor         AgentType = "cursor"
 	AgentIflow          AgentType = "iflow"
@@ -214,6 +215,32 @@ var Registry = []AgentDef{
 		},
 		FileBased:      true,
 		WatchRootsFunc: ResolveKiloWatchRoots,
+	},
+	{
+		// Kilo (legacy) is the legacy RooCode-derived VSCode
+		// extension from Kilocode. Sessions live under
+		// <vscode-globalStorage>/kilocode.kilo-code/tasks/<uuid>/
+		// with task_metadata.json (only `files_in_context`), the
+		// Claude-shaped api_conversation_history.json, and the
+		// Cline-shaped ui_messages.json. Default paths use the
+		// lowercase extension id that VSCode actually writes
+		// on disk, not the mixed-case marketplace id.
+		//
+		// LEGACY-ONLY: covers the pre-OpenCode extension
+		// (RooCode-derived). After Kilo rebuilt the extension on an
+		// OpenCode core (beta 2026-03-10, GA 2026-04-02), new
+		// sessions moved to ~/.local/share/kilo/kilo.db — the same
+		// SQLite the Kilo CLI uses — and are tracked by the `kilo`
+		// agent. This agent is frozen at the legacy tasks/<uuid>/
+		// format for historical sessions.
+		Type:        AgentKiloLegacy,
+		DisplayName: "Kilo (legacy)",
+		EnvVar:      "KILO_LEGACY_DIR",
+		ConfigKey:   "kilo_legacy_dirs",
+		DefaultDirs: kiloLegacyDefaultDirs(),
+		IDPrefix:    "kilo-legacy:",
+		FileBased:   true,
+		Usage:       UsageCapabilities{NoPerMessageTokenData: true},
 	},
 	{
 		Type:         AgentOpenHands,

@@ -37,7 +37,7 @@ func (t TargetSet) HasFileScopedAgents() bool {
 // its state DB) must stay on the full-archive flow, and new
 // file-scoped agents default to sanitized until added here.
 func verbatimFileScopedAgent(agent parser.AgentType) bool {
-	return agent == parser.AgentRooCode
+	return agent == parser.AgentRooCode || agent == parser.AgentKiloLegacy
 }
 
 // HasSanitizedFileScopedAgents reports whether any agent's export is

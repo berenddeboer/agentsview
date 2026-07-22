@@ -419,6 +419,7 @@ func TestRegistryCompleteness(t *testing.T) {
 		AgentMiMoCode,
 		AgentOpenCode,
 		AgentKilo,
+		AgentKiloLegacy,
 		AgentOpenHands,
 		AgentCursor,
 		AgentAmp,

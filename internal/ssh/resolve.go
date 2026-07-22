@@ -128,6 +128,32 @@ func buildResolveScript() string {
 			"av_emit_agent_file \"" + string(parser.AgentRooCode) + "\" \"$av_roo_task/ui_messages.json\"; " +
 			"done; " +
 			"}\n" +
+			// Kilo Legacy's root is VSCode's whole globalStorage
+			// extension directory, which can contain MCP settings,
+			// API credentials, caches, and other unrelated data. Emit
+			// only discovered per-task session files, never the raw
+			// directory, mirroring remotesync.resolveKiloLegacyTarget.
+			"av_emit_kilo_legacy_target() { " +
+			"target=\"$1\"; " +
+			"case \"$target\" in */) target=\"${target%/}\";; esac; " +
+			"av_kl_tasks=\"$target/tasks\"; " +
+			"[ -d \"$av_kl_tasks\" ] || return; " +
+			"av_kilo_legacy_root_emitted=0; " +
+			"for av_kl_task in \"$av_kl_tasks\"/*; do " +
+			"[ -d \"$av_kl_task\" ] || continue; " +
+			"[ -L \"$av_kl_task\" ] && continue; " +
+			"case \"${av_kl_task##*/}\" in _*|.*) continue;; esac; " +
+			"av_kl_metadata=\"$av_kl_task/task_metadata.json\"; " +
+			"[ -f \"$av_kl_metadata\" ] || continue; " +
+			"if [ \"$av_kilo_legacy_root_emitted\" -eq 0 ]; then " +
+			"printf '%s\\000' \"" + string(parser.AgentKiloLegacy) + ":$target\"; " +
+			"av_kilo_legacy_root_emitted=1; " +
+			"fi; " +
+			"av_emit_agent_file \"" + string(parser.AgentKiloLegacy) + "\" \"$av_kl_metadata\"; " +
+			"av_emit_agent_file \"" + string(parser.AgentKiloLegacy) + "\" \"$av_kl_task/ui_messages.json\"; " +
+			"av_emit_agent_file \"" + string(parser.AgentKiloLegacy) + "\" \"$av_kl_task/api_conversation_history.json\"; " +
+			"done; " +
+			"}\n" +
 			"av_emit_target() { " +
 			"agent=\"$1\"; " +
 			"target=\"$2\"; " +
@@ -137,6 +163,10 @@ func buildResolveScript() string {
 			"fi; " +
 			"if [ \"$agent\" = \"" + string(parser.AgentRooCode) + "\" ]; then " +
 			"av_emit_roocode_target \"$target\"; " +
+			"return; " +
+			"fi; " +
+			"if [ \"$agent\" = \"" + string(parser.AgentKiloLegacy) + "\" ]; then " +
+			"av_emit_kilo_legacy_target \"$target\"; " +
 			"return; " +
 			"fi; " +
 			"[ -d \"$target\" ] && printf '%s\\000' \"$agent:$target\"; " +

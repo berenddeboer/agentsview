@@ -334,6 +334,7 @@ thread JSON files.
 | Hermes Agent          | `~/.hermes/sessions/`                                                                                                                                                   |
 | iFlow                 | `~/.iflow/projects/`                                                                                                                                                    |
 | Kilo                  | `~/.local/share/kilo/`                                                                                                                                                  |
+| Kilo (legacy)         | `~/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code/` (macOS), `~/.config/Code/User/globalStorage/kilocode.kilo-code/` (Linux)                     |
 | Kimi                  | `~/.kimi/sessions/`                                                                                                                                                     |
 | Kiro CLI              | `~/.kiro/sessions/cli/`, `~/.local/share/kiro-cli/`                                                                                                                     |
 | Kiro IDE              | `~/Library/Application Support/Kiro/` (macOS)                                                                                                                           |
@@ -463,6 +464,13 @@ port and exporting `ANTIGRAVITY_DAEMON_URL` manually.
 Sidecars stay on your machine. agentsview makes no outbound request to produce
 or read them, and treats sidecars as untrusted structured input -- see
 [SECURITY.md](SECURITY.md) for the trust model.
+
+### Kilo vs Kilo (legacy).
+
+*Kilo* is the OpenCode-based CLI/editor core (`~/.local/share/kilo/kilo.db`); 
+it covers both the Kilo CLI and the rebuilt Kilo Code VS Code extension (after 
+March 2026), which shares that same database. *Kilo (legacy)* is the legacy RooCode-derived
+VS Code extension that wrote per-task JSON under `kilocode.kilo-code/tasks/`.
 
 ## PostgreSQL Sync
 

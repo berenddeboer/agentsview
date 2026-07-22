@@ -12,6 +12,8 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
   { name: "devin", color: "var(--accent-red)", label: "Devin" },
   { name: "gemini", color: "var(--accent-rose)" },
   { name: "opencode", color: "var(--accent-purple)" },
+  { name: "kilo", color: "var(--accent-purple)", label: "Kilo" },
+  { name: "kilo-legacy", color: "var(--accent-purple)", label: "Kilo (legacy)" },
   { name: "openhands", color: "var(--accent-teal)", label: "OpenHands" },
   { name: "cursor", color: "var(--accent-black)" },
   { name: "amp", color: "var(--accent-coral)", label: "Amp" },

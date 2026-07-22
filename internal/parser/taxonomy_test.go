@@ -53,6 +53,20 @@ func TestNormalizeToolCategory(t *testing.T) {
 		{"glob", "Glob"},
 		{"task", "Task"},
 
+		// Kilo (legacy) / RooCode (Cline-family) camelCase tool names.
+		{"appliedDiff", "Edit"},
+		{"editedExistingFile", "Edit"},
+		{"deleteFile", "Edit"},
+		{"searchFiles", "Grep"},
+		{"codebaseSearch", "Grep"},
+		{"writeToFile", "Write"},
+		{"newFileCreated", "Write"},
+		{"executeCommand", "Bash"},
+		{"newTask", "Task"},
+		{"updateTodoList", "Tool"},
+		{"finishTask", "Tool"},
+		{"switchMode", "Tool"},
+
 		// Amp tools
 		{"create_file", "Write"},
 		{"look_at", "Read"},

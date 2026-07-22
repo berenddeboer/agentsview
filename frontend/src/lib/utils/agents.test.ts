@@ -18,6 +18,8 @@ describe("KNOWN_AGENTS", () => {
       "devin",
       "gemini",
       "opencode",
+      "kilo",
+      "kilo-legacy",
       "openhands",
       "cursor",
       "amp",
