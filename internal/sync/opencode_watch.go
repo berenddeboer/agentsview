@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"log"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -161,8 +162,6 @@ func (e *Engine) rebaselineOpenCodeWatch(ctx context.Context) {
 	for dbPath := range e.openCodeWatch {
 		delete(e.openCodeWatch, dbPath)
 	}
-	for dbPath, state := range baselines {
-		e.openCodeWatch[dbPath] = state
-	}
+	maps.Copy(e.openCodeWatch, baselines)
 	e.openCodeWatchMu.Unlock()
 }

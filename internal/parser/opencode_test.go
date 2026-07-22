@@ -213,7 +213,7 @@ func TestListOpenCodeSessionMetaByIDIsTargeted(t *testing.T) {
 	dbPath, seeder, writer := newTestDB(t)
 	defer writer.Close()
 	seeder.AddProject("prj", "/tmp/project")
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		seeder.AddSession(fmt.Sprintf("ses_%03d", i), "prj", "", "", 1, int64(i+1))
 	}
 
@@ -241,7 +241,7 @@ func TestOpenCodeJournalWorkIsArchiveCardinalityIndependent(t *testing.T) {
 				VALUES (?, 'prj', 1, 2)
 			`)
 			require.NoError(t, err)
-			for i := 0; i < archiveSize; i++ {
+			for i := range archiveSize {
 				_, err = stmt.Exec(fmt.Sprintf("ses_%05d", i))
 				require.NoError(t, err)
 			}
