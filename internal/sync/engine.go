@@ -290,6 +290,10 @@ type Engine struct {
 	providerWatchRoots      map[parser.AgentType][]parser.WatchRoot
 	openCodeWatchMu         gosync.Mutex
 	openCodeWatch           map[string]openCodeWatchState
+	// stagedOpenCodeWatch holds a pre-discovery journal baseline captured during
+	// resyncBuildLocked. It is installed only after a successful swap so a
+	// discarded rebuild cannot advance the watcher watermark.
+	stagedOpenCodeWatch map[string]openCodeWatchState
 	projectIdentityMu       gosync.Mutex
 	projectIdentityCache    map[string]projectIdentityCacheEntry
 	projectIdentityWritten  map[string]struct{}
@@ -1726,6 +1730,7 @@ func (e *Engine) resyncAllWithOptionsLocked(
 
 	stats, err := e.resyncBuildLocked(ctx, onProgress, opts, ops)
 	if err != nil || stats.Aborted {
+		e.stagedOpenCodeWatch = nil
 		return stats, err
 	}
 	swapStageReached = true
@@ -1741,6 +1746,7 @@ func (e *Engine) resyncAllWithOptionsLocked(
 			e.skipCache = preBuildSkipCache
 			e.skipHashKeys = preBuildSkipHashKeys
 			e.skipMu.Unlock()
+			e.stagedOpenCodeWatch = nil
 		}
 		e.setLastSyncStats(stats)
 		return stats, swapErr
@@ -1762,6 +1768,9 @@ func (e *Engine) resyncBuildLocked(
 	ctx context.Context, onProgress ProgressFunc, opts RebuildOptions,
 	ops rebuildOperations,
 ) (stats SyncStats, retErr error) {
+	// A prior successful build that never swapped must not install after a
+	// later discarded rebuild.
+	e.stagedOpenCodeWatch = nil
 	reportResyncProgress := func(p Progress) {
 		p.Resync = true
 		if p.Phase == PhaseSyncing && p.Detail == "" {
@@ -1969,8 +1978,10 @@ func (e *Engine) resyncBuildLocked(
 		"Discovering sessions",
 		"",
 	)
-	stats = e.syncAllLocked(
+	var stagedOpenCodeWatch map[string]openCodeWatchState
+	stats = e.syncAllLockedStagingOpenCodeWatch(
 		ctx, reportResyncProgress, time.Time{}, nil, syncWriteBulk, true, false,
+		&stagedOpenCodeWatch,
 	)
 	e.db = origDB // restore immediately
 	e.archiveStore = nil
@@ -2339,6 +2350,9 @@ func (e *Engine) resyncBuildLocked(
 		e.mu.Unlock()
 		return stats, err
 	}
+	// Stage only after the replacement is fully built and closed. ResetCachesAfterSwap
+	// installs it once the live archive has been swapped successfully.
+	e.stagedOpenCodeWatch = stagedOpenCodeWatch
 	return stats, nil
 }
 
@@ -2478,12 +2492,18 @@ func (e *Engine) SwapResyncDatabase(tempPath string) error {
 // storage sessions, and verified sources, then reloads the skip cache from the
 // swapped archive so the engine carries warm skip state. skipFingerprints is
 // reset to empty, matching engine construction (fingerprints are recomputed on
-// the next sync, never persisted). The caller invokes it immediately after a
-// successful SwapResyncDatabase.
+// the next sync, never persisted). When a resync build staged an OpenCode
+// journal baseline, it is installed here so a discarded rebuild cannot advance
+// the watcher watermark. The caller invokes it immediately after a successful
+// SwapResyncDatabase.
 func (e *Engine) ResetCachesAfterSwap() error {
 	e.clearTrustedSQLiteContainers()
 	e.clearTrustedOpenCodeStorageSessions()
 	e.clearVerifiedSources()
+	if e.stagedOpenCodeWatch != nil {
+		e.installOpenCodeWatchBaseline(e.stagedOpenCodeWatch)
+		e.stagedOpenCodeWatch = nil
+	}
 	return e.ReloadSkipCache()
 }
 
@@ -4465,6 +4485,18 @@ func (e *Engine) syncAllLocked(
 	scope *rootSyncScope, writeMode syncWriteMode, recordSyncState bool,
 	forceDiscoveredFiles bool,
 ) (stats SyncStats) {
+	return e.syncAllLockedStagingOpenCodeWatch(
+		ctx, onProgress, since, scope, writeMode, recordSyncState,
+		forceDiscoveredFiles, nil,
+	)
+}
+
+func (e *Engine) syncAllLockedStagingOpenCodeWatch(
+	ctx context.Context, onProgress ProgressFunc, since time.Time,
+	scope *rootSyncScope, writeMode syncWriteMode, recordSyncState bool,
+	forceDiscoveredFiles bool,
+	stagedOpenCodeWatch *map[string]openCodeWatchState,
+) (stats SyncStats) {
 	if ctx.Err() != nil {
 		return SyncStats{Aborted: true}
 	}
@@ -4499,6 +4531,16 @@ func (e *Engine) syncAllLocked(
 		Phase:  PhaseDiscovering,
 		Detail: "Discovering sessions",
 	})
+	var (
+		openCodeBaseline   map[string]openCodeWatchState
+		openCodeBaselineOK bool
+	)
+	if scope == nil && since.IsZero() {
+		// Capture before discovery so events committed while the pass is
+		// parsing remain after the installed watermark for watcher processing.
+		openCodeBaseline, openCodeBaselineOK =
+			e.captureOpenCodeWatchBaseline(ctx)
+	}
 
 	// Container states must be captured BEFORE discovery lists any session
 	// rows, so a promoted state can never be newer than the discovered
@@ -4751,8 +4793,12 @@ func (e *Engine) syncAllLocked(
 	if recordSyncState && stats.providerFailures == 0 {
 		e.recordSyncFinished()
 	}
-	if scope == nil && since.IsZero() && providerFailures == 0 && stats.Failed == 0 {
-		e.rebaselineOpenCodeWatch(ctx)
+	if openCodeBaselineOK && providerFailures == 0 && stats.Failed == 0 {
+		if stagedOpenCodeWatch != nil {
+			*stagedOpenCodeWatch = openCodeBaseline
+		} else {
+			e.installOpenCodeWatchBaseline(openCodeBaseline)
+		}
 	}
 	// Emission happens in SyncAll / SyncAllSince after syncMu is
 	// released; syncAllLocked runs under the caller's lock.

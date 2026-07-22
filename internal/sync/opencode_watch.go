@@ -140,24 +140,38 @@ func (e *Engine) classifyOpenCodeJournalPath(
 	return sources, true
 }
 
-func (e *Engine) rebaselineOpenCodeWatch(ctx context.Context) {
+func (e *Engine) captureOpenCodeWatchBaseline(
+	ctx context.Context,
+) (map[string]openCodeWatchState, bool) {
 	baselines := make(map[string]openCodeWatchState)
 	for _, root := range e.agentDirs[parser.AgentOpenCode] {
 		if err := ctx.Err(); err != nil {
-			return
+			return nil, false
 		}
 		dbPath := parser.ResolveOpenCodeSource(filepath.Clean(root)).DBPath
 		if dbPath == "" {
 			continue
 		}
 		high, supported, err := parser.OpenCodeJournalHighWater(ctx, dbPath)
-		if err != nil || !supported {
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Printf("opencode watcher full-sync baseline: %v", err)
+			}
+			return nil, false
+		}
+		if !supported {
 			continue
 		}
 		baselines[dbPath] = openCodeWatchState{
 			rowID: high, pending: make(map[string]struct{}),
 		}
 	}
+	return baselines, true
+}
+
+func (e *Engine) installOpenCodeWatchBaseline(
+	baselines map[string]openCodeWatchState,
+) {
 	e.openCodeWatchMu.Lock()
 	for dbPath := range e.openCodeWatch {
 		delete(e.openCodeWatch, dbPath)

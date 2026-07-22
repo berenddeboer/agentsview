@@ -779,6 +779,44 @@ func TestSyncEngineOpenCodeJournalDefersStreamingUntilSettlement(
 	assert.Equal(t, *after.LocalModifiedAt, *unchanged.LocalModifiedAt)
 }
 
+func TestSyncEngineOpenCodeEventCommittedDuringFullSyncRemainsWatchable(
+	t *testing.T,
+) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	oc := createOpenCodeDB(t, env.opencodeDir)
+	oc.addProject(t, "proj", "/home/user/code/opencode-app")
+	seedOpenCodeSQLiteTextSession(
+		t, oc, "proj", "ses_during_sync",
+		1779012000000, 1779012030000,
+		"original prompt", "original answer",
+	)
+
+	mutated := false
+	stats := env.engine.SyncAll(context.Background(), func(progress sync.Progress) {
+		if mutated || progress.Phase != sync.PhaseDone {
+			return
+		}
+		mutated = true
+		oc.replaceTextContent(
+			t, "ses_during_sync", "late prompt", "late answer",
+			1779012000000,
+		)
+		oc.addEvent(
+			t, "evt_late", "ses_during_sync", "session.updated.1",
+			`{"time":1}`, 1,
+		)
+	})
+	require.False(t, stats.Aborted)
+	require.True(t, mutated)
+	sessionID := "opencode:ses_during_sync"
+	assertMessageContent(
+		t, env.db, sessionID, "original prompt", "original answer",
+	)
+
+	env.engine.SyncPaths([]string{oc.path})
+	assertMessageContent(t, env.db, sessionID, "late prompt", "late answer")
+}
+
 // TestSyncEngineOpenCodeSQLiteUntouchedContainerSkipsReparse pins the
 // container-level freshness gate: when the shared opencode.db file is
 // completely untouched since the last verified sync, its sessions must be
