@@ -3129,6 +3129,30 @@ func (e *Engine) reconcileWatchRootsStreamed(
 	if force {
 		e.clearWatcherOverflowCaches()
 	}
+	scope := newRootSyncScope(roots)
+	if full {
+		scope = nil
+	} else if scope != nil {
+		scope.agent = agent
+	}
+	var (
+		openCodeBaseline   map[string]openCodeWatchState
+		openCodeBaselineOK bool
+	)
+	if force {
+		// Capture before authoritative discovery. Installing this pre-pass
+		// watermark after success leaves events committed during reconciliation
+		// visible to the next watcher batch.
+		openCodeBaseline, openCodeBaselineOK =
+			e.captureOpenCodeWatchBaselineForScope(ctx, scope)
+		defer func() {
+			if retErr == nil && ctx.Err() == nil && !stats.Aborted &&
+				stats.Failed == 0 && stats.providerFailures == 0 &&
+				openCodeBaselineOK {
+				e.mergeOpenCodeWatchBaseline(openCodeBaseline)
+			}
+		}()
+	}
 	e.phaseStats.Reset()
 	e.anomalies.reset()
 	defer func() { e.anomalies.applyTo(&stats) }()
@@ -3167,12 +3191,6 @@ func (e *Engine) reconcileWatchRootsStreamed(
 		}
 	}()
 
-	scope := newRootSyncScope(roots)
-	if full {
-		scope = nil
-	} else if scope != nil {
-		scope.agent = agent
-	}
 	preContainerStates := e.captureSQLiteContainerStates(nil)
 	providers, completedScopes, failedRoots, failures, discoveryErr, err := e.streamReconciliationCandidates(
 		ctx, scope, spool,

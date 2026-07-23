@@ -7465,6 +7465,76 @@ func TestOpenCodeWatchPendingOverflowClearsState(t *testing.T) {
 	assert.Empty(t, state.pending)
 }
 
+func TestOpenCodeWatchLostEventReconciliationRebasesBeforeDiscovery(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "opencode.db")
+	seedOpenCodeSQLiteWALSession(t, dbPath, "ses_lost_events")
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenCode: {root}},
+		Machine:   "local",
+	})
+	t.Cleanup(engine.Close)
+
+	stats := engine.SyncAll(t.Context(), nil)
+	require.Equal(t, 1, stats.Synced)
+	updatePart := func(content string) {
+		writer, err := sql.Open("sqlite3", dbPath)
+		require.NoError(t, err)
+		_, err = writer.Exec(
+			`UPDATE part SET data = ? WHERE id = 'part_1'`,
+			`{"type":"text","text":"`+content+`"}`,
+		)
+		require.NoError(t, err)
+		require.NoError(t, writer.Close())
+	}
+	updatePart("reconciled")
+	for seq := 2; seq <= openCodeJournalBatchLimit+1; seq++ {
+		addOpenCodeSQLiteTestEvent(
+			t, dbPath, fmt.Sprintf("evt_backlog_%03d", seq),
+			"ses_lost_events", "message.part.updated.1", `{"time":2}`, seq,
+		)
+	}
+
+	mutatedDuringReconciliation := false
+	engine.writeBatchOverride = func(
+		pending []pendingWrite, mode syncWriteMode, forceReplace bool,
+	) (int, int, int, int) {
+		outcome := engine.writeBatchWithOutcome(pending, mode, forceReplace)
+		if !mutatedDuringReconciliation {
+			mutatedDuringReconciliation = true
+			updatePart("during reconciliation")
+			addOpenCodeSQLiteTestEvent(
+				t, dbPath, "evt_during_reconciliation", "ses_lost_events",
+				"message.updated.1",
+				`{"info":{"role":"assistant","time":{"completed":3}}}`,
+				openCodeJournalBatchLimit+2,
+			)
+		}
+		return outcome.writtenSessions, outcome.writtenMessages,
+			outcome.failedSessions, outcome.cwdFiltered
+	}
+	require.NoError(t, engine.ReconcileWatchRootsAfterLostEvents(
+		t.Context(), []string{root}, false,
+	))
+	engine.writeBatchOverride = nil
+	require.True(t, mutatedDuringReconciliation)
+	messages, err := database.GetMessages(
+		t.Context(), "opencode:ses_lost_events", 0, 10, true,
+	)
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	assert.Equal(t, "reconciled", messages[0].Content)
+
+	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{dbPath}))
+	messages, err = database.GetMessages(
+		t.Context(), "opencode:ses_lost_events", 0, 10, true,
+	)
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	assert.Equal(t, "during reconciliation", messages[0].Content)
+}
+
 func TestEngine_ClassifyPathsOpenCodeRemovedMessageFile(
 	t *testing.T,
 ) {

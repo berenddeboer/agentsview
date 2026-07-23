@@ -160,10 +160,22 @@ func (e *Engine) InitializeOpenCodeWatchBaseline(ctx context.Context) {
 func (e *Engine) captureOpenCodeWatchBaseline(
 	ctx context.Context,
 ) (map[string]openCodeWatchState, bool) {
+	return e.captureOpenCodeWatchBaselineForScope(ctx, nil)
+}
+
+func (e *Engine) captureOpenCodeWatchBaselineForScope(
+	ctx context.Context, scope *rootSyncScope,
+) (map[string]openCodeWatchState, bool) {
 	baselines := make(map[string]openCodeWatchState)
+	if !scope.matchesAgent(parser.AgentOpenCode) {
+		return baselines, true
+	}
 	for _, root := range e.agentDirs[parser.AgentOpenCode] {
 		if err := ctx.Err(); err != nil {
 			return nil, false
+		}
+		if !scope.includes(root) {
+			continue
 		}
 		dbPath := parser.ResolveOpenCodeSource(filepath.Clean(root)).DBPath
 		if dbPath == "" {
@@ -203,6 +215,14 @@ func (e *Engine) installOpenCodeWatchBaseline(
 	for dbPath := range e.openCodeWatch {
 		delete(e.openCodeWatch, dbPath)
 	}
+	maps.Copy(e.openCodeWatch, baselines)
+	e.openCodeWatchMu.Unlock()
+}
+
+func (e *Engine) mergeOpenCodeWatchBaseline(
+	baselines map[string]openCodeWatchState,
+) {
+	e.openCodeWatchMu.Lock()
 	maps.Copy(e.openCodeWatch, baselines)
 	e.openCodeWatchMu.Unlock()
 }
