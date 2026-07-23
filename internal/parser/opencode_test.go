@@ -96,7 +96,24 @@ func (s *OpenCodeSeeder) AddProject(id, worktree string) {
 
 func (s *OpenCodeSeeder) AddSession(id, projectID, parentID, title string, timeCreated, timeUpdated int64) {
 	s.t.Helper()
-	s.AddSessionDirectory(id, projectID, parentID, title, "", timeCreated, timeUpdated)
+
+	var pID, tStr any
+	if parentID != "" {
+		pID = parentID
+	}
+	if title != "" {
+		tStr = title
+	}
+
+	// Omit directory so the same helper works on legacy schemas that
+	// lack the column; modern fixtures default directory to ''.
+	_, err := s.db.Exec(
+		`INSERT INTO session
+			(id, project_id, parent_id, title, time_created, time_updated)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		id, projectID, pID, tStr, timeCreated, timeUpdated,
+	)
+	require.NoError(s.t, err, "add session")
 }
 
 func (s *OpenCodeSeeder) AddSessionDirectory(
@@ -120,7 +137,7 @@ func (s *OpenCodeSeeder) AddSessionDirectory(
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		id, projectID, pID, tStr, directory, timeCreated, timeUpdated,
 	)
-	require.NoError(s.t, err, "add session")
+	require.NoError(s.t, err, "add session with directory")
 }
 
 func (s *OpenCodeSeeder) AddMessage(id, sessionID string, timeCreated, timeUpdated int64, data string) {
@@ -1126,6 +1143,103 @@ func TestParseOpenCodeDB_EmptySessionDirectoryUsesProjectWorktree(t *testing.T) 
 	s := sessions[0].Session
 	assert.Equal(t, "/home/user/code/myapp", s.Cwd)
 	assert.Equal(t, "myapp", s.Project)
+}
+
+// openCodeSchemaLegacy omits session.directory, matching older OpenCode-family
+// SQLite layouts still used by Kilo/MiMoCode/ICodeMate archives.
+const openCodeSchemaLegacy = `
+CREATE TABLE project (
+	id TEXT PRIMARY KEY,
+	worktree TEXT NOT NULL,
+	time_created INTEGER NOT NULL DEFAULT 0,
+	time_updated INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE session (
+	id TEXT PRIMARY KEY,
+	project_id TEXT NOT NULL,
+	parent_id TEXT,
+	title TEXT,
+	time_created INTEGER NOT NULL,
+	time_updated INTEGER NOT NULL,
+	FOREIGN KEY (project_id) REFERENCES project(id)
+);
+
+CREATE TABLE message (
+	id TEXT PRIMARY KEY,
+	session_id TEXT NOT NULL,
+	time_created INTEGER NOT NULL,
+	time_updated INTEGER NOT NULL,
+	data TEXT NOT NULL,
+	FOREIGN KEY (session_id) REFERENCES session(id)
+);
+
+CREATE TABLE part (
+	id TEXT PRIMARY KEY,
+	message_id TEXT NOT NULL,
+	session_id TEXT NOT NULL,
+	time_created INTEGER NOT NULL,
+	time_updated INTEGER NOT NULL,
+	data TEXT NOT NULL,
+	FOREIGN KEY (message_id) REFERENCES message(id)
+);
+`
+
+func newLegacyOpenCodeTestDB(t *testing.T) (string, *OpenCodeSeeder, *sql.DB) {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "opencode-legacy.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err, "open legacy test db")
+	_, err = db.Exec(openCodeSchemaLegacy)
+	require.NoError(t, err, "create legacy schema")
+	return dbPath, &OpenCodeSeeder{db: db, t: t}, db
+}
+
+func TestParseOpenCodeDB_LegacySchemaWithoutDirectoryUsesProjectWorktree(t *testing.T) {
+	dbPath, seeder, db := newLegacyOpenCodeTestDB(t)
+	defer db.Close()
+
+	seeder.AddProject("prj_legacy", "/home/user/code/legacy-app")
+	// AddSession inserts without directory; legacy schema has no such column.
+	seeder.AddSession(
+		"ses_legacy", "prj_legacy", "", "Legacy Session",
+		1700000000000, 1700000010000,
+	)
+	seeder.AddMessage("msg_1", "ses_legacy", 1700000000000, 1700000000000, `{"role":"user"}`)
+	seeder.AddPart(
+		"prt_1", "msg_1", "ses_legacy",
+		1700000000000, 1700000000000,
+		`{"type":"text","text":"hello from legacy schema"}`,
+	)
+
+	// Confirm the column is actually absent so the test would fail closed
+	// if the modern SELECT path were used.
+	hasDir, err := openCodeSessionTableHasDirectory(db)
+	require.NoError(t, err)
+	require.False(t, hasDir, "legacy fixture must omit session.directory")
+
+	sessions, err := parseOpenCodeAll(dbPath, "testmachine")
+	require.NoError(t, err, "ParseOpenCodeDB on legacy schema")
+	require.Len(t, sessions, 1)
+
+	s := sessions[0].Session
+	assert.Equal(t, "/home/user/code/legacy-app", s.Cwd)
+	assert.Equal(t, "legacy_app", s.Project)
+}
+
+func TestParseOpenCodeDB_ModernSchemaDirectoryColumnDetected(t *testing.T) {
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+	seedStandardSession(t, seeder)
+
+	hasDir, err := openCodeSessionHasDirectoryCached(db, dbPath)
+	require.NoError(t, err)
+	assert.True(t, hasDir, "modern fixture must include session.directory")
+
+	sessions, err := parseOpenCodeAll(dbPath, "testmachine")
+	require.NoError(t, err)
+	require.Len(t, sessions, 1)
+	assert.Equal(t, "/home/user/code/myapp", sessions[0].Session.Cwd)
 }
 
 func TestParseOpenCodeSession_SingleSession(t *testing.T) {

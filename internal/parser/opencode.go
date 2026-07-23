@@ -148,7 +148,14 @@ func parseOpenCodeDBSession(
 		)
 	}
 
-	s, err := loadOneOpenCodeSession(db, sessionID)
+	hasDirectory, err := openCodeSessionHasDirectoryCached(db, dbPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf(
+			"probing opencode session schema: %w", err,
+		)
+	}
+
+	s, err := loadOneOpenCodeSession(db, sessionID, hasDirectory)
 	if err != nil {
 		return nil, nil, fmt.Errorf(
 			"loading opencode session %s: %w",
@@ -367,24 +374,120 @@ type openCodeSessionRow struct {
 	timeUpdated int64
 }
 
+type openCodeSessionSchemaCacheEntry struct {
+	state        SQLiteContainerState
+	hasDirectory bool
+}
+
+// openCodeSessionSchemaCache memoizes whether session.directory exists for
+// each shared OpenCode SQLite path. Legacy OpenCode-family DBs (older
+// OpenCode, Kilo, MiMoCode, ICodeMate) omit the column; probing once per
+// container state avoids a PRAGMA on every session parse.
+var (
+	openCodeSessionSchemaCacheMu sync.Mutex
+	openCodeSessionSchemaCache   = map[string]openCodeSessionSchemaCacheEntry{}
+)
+
+func openCodeSessionHasDirectoryCached(
+	db *sql.DB, dbPath string,
+) (bool, error) {
+	state, ok := StatSQLiteContainerState(dbPath)
+	if !ok {
+		return openCodeSessionTableHasDirectory(db)
+	}
+	openCodeSessionSchemaCacheMu.Lock()
+	entry, hit := openCodeSessionSchemaCache[dbPath]
+	openCodeSessionSchemaCacheMu.Unlock()
+	if hit && entry.state == state {
+		return entry.hasDirectory, nil
+	}
+	hasDirectory, err := openCodeSessionTableHasDirectory(db)
+	if err != nil {
+		return false, err
+	}
+	openCodeSessionSchemaCacheMu.Lock()
+	openCodeSessionSchemaCache[dbPath] = openCodeSessionSchemaCacheEntry{
+		state:        state,
+		hasDirectory: hasDirectory,
+	}
+	openCodeSessionSchemaCacheMu.Unlock()
+	return hasDirectory, nil
+}
+
+func openCodeSessionTableHasDirectory(db *sql.DB) (bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(session)`)
+	if err != nil {
+		return false, fmt.Errorf(
+			"listing opencode session table info: %w", err,
+		)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			typeName   string
+			notNull    int
+			defaultV   sql.NullString
+			primaryKey int
+		)
+		if err := rows.Scan(
+			&cid, &name, &typeName, &notNull, &defaultV, &primaryKey,
+		); err != nil {
+			return false, fmt.Errorf(
+				"scanning opencode session table info: %w", err,
+			)
+		}
+		if strings.EqualFold(name, "directory") {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
 func loadOneOpenCodeSession(
-	db *sql.DB, sessionID string,
+	db *sql.DB, sessionID string, hasDirectory bool,
 ) (openCodeSessionRow, error) {
-	row := db.QueryRow(`
+	var (
+		row *sql.Row
+		s   openCodeSessionRow
+		err error
+	)
+	if hasDirectory {
+		row = db.QueryRow(`
+			SELECT s.id, s.project_id,
+			       COALESCE(s.parent_id, ''),
+			       COALESCE(s.title, ''),
+			       COALESCE(s.directory, ''),
+			       s.time_created, s.time_updated
+			FROM session s
+			WHERE s.id = ?
+		`, sessionID)
+		err = row.Scan(
+			&s.id, &s.projectID, &s.parentID,
+			&s.title, &s.directory,
+			&s.timeCreated, &s.timeUpdated,
+		)
+		return s, err
+	}
+
+	// Legacy OpenCode-family schemas omit session.directory; cwd falls
+	// back to project.worktree via resolveOpenCodeWorktree.
+	row = db.QueryRow(`
 		SELECT s.id, s.project_id,
 		       COALESCE(s.parent_id, ''),
 		       COALESCE(s.title, ''),
-		       COALESCE(s.directory, ''),
 		       s.time_created, s.time_updated
 		FROM session s
 		WHERE s.id = ?
 	`, sessionID)
-
-	var s openCodeSessionRow
-	err := row.Scan(
+	err = row.Scan(
 		&s.id, &s.projectID, &s.parentID,
-		&s.title, &s.directory,
-		&s.timeCreated, &s.timeUpdated,
+		&s.title, &s.timeCreated, &s.timeUpdated,
 	)
 	return s, err
 }
