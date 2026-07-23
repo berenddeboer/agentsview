@@ -223,6 +223,11 @@ Grok section and remove the explicit registry exception in the coverage test.
 - **Usage and cost:** Assistant messages persist input, output, cache-read, and
   cache-write tokens, plus model/provider identity. Agentsview computes price
   from those tokens rather than consuming a persisted USD total.
+- **Working directory:** SQLite sessions store a per-session `directory` and a
+  `project_id`. The synthetic `global` project uses `worktree=/`. Agentsview
+  prefers a concrete `session.directory` over `project.worktree` when resolving
+  cwd/project (verified against live `opencode.db` rows under `project_id=global`
+  on 2026-07-23; see #1236).
 - **Agentsview:** `internal/parser/opencode.go`,
   `internal/parser/opencode_provider.go`, and
   `internal/parser/opencode_storage_state.go`; legacy and database layouts are

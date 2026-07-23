@@ -156,10 +156,33 @@ func parseOpenCodeDBSession(
 		)
 	}
 
-	worktree := projects[s.projectID]
+	worktree := resolveOpenCodeWorktree(
+		s.directory, projects[s.projectID],
+	)
 	return buildOpenCodeSession(
 		db, s, worktree, dbPath, machine,
 	)
+}
+
+// resolveOpenCodeWorktree picks the session working directory used for
+// cwd/project. OpenCode's synthetic "global" project stores worktree="/",
+// while session.directory still holds the real path the session ran in.
+// Prefer a concrete session directory; fall back to the project worktree.
+func resolveOpenCodeWorktree(
+	sessionDirectory, projectWorktree string,
+) string {
+	if dir := strings.TrimSpace(sessionDirectory); openCodeUsableWorktree(dir) {
+		return dir
+	}
+	return strings.TrimSpace(projectWorktree)
+}
+
+func openCodeUsableWorktree(path string) bool {
+	if path == "" {
+		return false
+	}
+	// Root is OpenCode's global-project placeholder, not a real project cwd.
+	return path != string(filepath.Separator) && path != "/"
 }
 
 // parseOpenCodeStorageFile parses a file-backed OpenCode storage
@@ -339,6 +362,7 @@ type openCodeSessionRow struct {
 	projectID   string
 	parentID    string
 	title       string
+	directory   string
 	timeCreated int64
 	timeUpdated int64
 }
@@ -350,6 +374,7 @@ func loadOneOpenCodeSession(
 		SELECT s.id, s.project_id,
 		       COALESCE(s.parent_id, ''),
 		       COALESCE(s.title, ''),
+		       COALESCE(s.directory, ''),
 		       s.time_created, s.time_updated
 		FROM session s
 		WHERE s.id = ?
@@ -358,7 +383,8 @@ func loadOneOpenCodeSession(
 	var s openCodeSessionRow
 	err := row.Scan(
 		&s.id, &s.projectID, &s.parentID,
-		&s.title, &s.timeCreated, &s.timeUpdated,
+		&s.title, &s.directory,
+		&s.timeCreated, &s.timeUpdated,
 	)
 	return s, err
 }

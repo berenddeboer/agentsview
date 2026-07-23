@@ -52,6 +52,7 @@ CREATE TABLE session (
 	project_id TEXT NOT NULL,
 	parent_id TEXT,
 	title TEXT,
+	directory TEXT NOT NULL DEFAULT '',
 	time_created INTEGER NOT NULL,
 	time_updated INTEGER NOT NULL,
 	FOREIGN KEY (project_id) REFERENCES project(id)
@@ -95,6 +96,14 @@ func (s *OpenCodeSeeder) AddProject(id, worktree string) {
 
 func (s *OpenCodeSeeder) AddSession(id, projectID, parentID, title string, timeCreated, timeUpdated int64) {
 	s.t.Helper()
+	s.AddSessionDirectory(id, projectID, parentID, title, "", timeCreated, timeUpdated)
+}
+
+func (s *OpenCodeSeeder) AddSessionDirectory(
+	id, projectID, parentID, title, directory string,
+	timeCreated, timeUpdated int64,
+) {
+	s.t.Helper()
 
 	var pID, tStr any
 	if parentID != "" {
@@ -104,8 +113,13 @@ func (s *OpenCodeSeeder) AddSession(id, projectID, parentID, title string, timeC
 		tStr = title
 	}
 
-	_, err := s.db.Exec(`INSERT INTO session (id, project_id, parent_id, title, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?)`,
-		id, projectID, pID, tStr, timeCreated, timeUpdated)
+	_, err := s.db.Exec(
+		`INSERT INTO session
+			(id, project_id, parent_id, title, directory,
+			 time_created, time_updated)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		id, projectID, pID, tStr, directory, timeCreated, timeUpdated,
+	)
 	require.NoError(s.t, err, "add session")
 }
 
@@ -1010,6 +1024,108 @@ func TestParseOpenCodeDB_ProjectFromWorktree(t *testing.T) {
 	assertEq(t, "sessions len", len(sessions), 1)
 
 	assertEq(t, "Project", sessions[0].Session.Project, "my_project")
+}
+
+func TestResolveOpenCodeWorktree(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		session string
+		project string
+		want    string
+	}{
+		{
+			name:    "prefers concrete session directory over global project",
+			session: "/home/user/code/myapp",
+			project: "/",
+			want:    "/home/user/code/myapp",
+		},
+		{
+			name:    "falls back when session directory empty",
+			session: "",
+			project: "/home/user/code/myapp",
+			want:    "/home/user/code/myapp",
+		},
+		{
+			name:    "falls back when session directory is root",
+			session: "/",
+			project: "/home/user/code/myapp",
+			want:    "/home/user/code/myapp",
+		},
+		{
+			name:    "trims session directory whitespace",
+			session: "  /home/user/code/myapp  ",
+			project: "/",
+			want:    "/home/user/code/myapp",
+		},
+		{
+			name:    "keeps project root when session unusable",
+			session: "/",
+			project: "/",
+			want:    "/",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := resolveOpenCodeWorktree(tt.session, tt.project)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestParseOpenCodeDB_PrefersSessionDirectoryOverGlobalProject(t *testing.T) {
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+
+	// OpenCode's synthetic global project uses worktree="/".
+	seeder.AddProject("global", "/")
+	seeder.AddSessionDirectory(
+		"ses_global", "global", "", "Global Session",
+		"/home/user/code/lonely-app",
+		1700000000000, 1700000010000,
+	)
+	seeder.AddMessage("msg_1", "ses_global", 1700000000000, 1700000000000, `{"role":"user"}`)
+	seeder.AddPart(
+		"prt_1", "msg_1", "ses_global",
+		1700000000000, 1700000000000,
+		`{"type":"text","text":"hello from global project"}`,
+	)
+
+	sessions, err := parseOpenCodeAll(dbPath, "testmachine")
+	require.NoError(t, err, "ParseOpenCodeDB")
+	require.Len(t, sessions, 1)
+
+	s := sessions[0].Session
+	assert.Equal(t, "/home/user/code/lonely-app", s.Cwd)
+	assert.Equal(t, "lonely_app", s.Project)
+	assert.NotEqual(t, "unknown", s.Project)
+}
+
+func TestParseOpenCodeDB_EmptySessionDirectoryUsesProjectWorktree(t *testing.T) {
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+
+	seeder.AddProject("prj_1", "/home/user/code/myapp")
+	seeder.AddSessionDirectory(
+		"ses_empty_dir", "prj_1", "", "No Directory",
+		"",
+		1700000000000, 1700000010000,
+	)
+	seeder.AddMessage("msg_1", "ses_empty_dir", 1700000000000, 1700000000000, `{"role":"user"}`)
+	seeder.AddPart(
+		"prt_1", "msg_1", "ses_empty_dir",
+		1700000000000, 1700000000000,
+		`{"type":"text","text":"hello"}`,
+	)
+
+	sessions, err := parseOpenCodeAll(dbPath, "testmachine")
+	require.NoError(t, err, "ParseOpenCodeDB")
+	require.Len(t, sessions, 1)
+
+	s := sessions[0].Session
+	assert.Equal(t, "/home/user/code/myapp", s.Cwd)
+	assert.Equal(t, "myapp", s.Project)
 }
 
 func TestParseOpenCodeSession_SingleSession(t *testing.T) {
