@@ -280,20 +280,20 @@ type Engine struct {
 	// idPrefix and pathRewriter support remote sync:
 	// prefix all session IDs to avoid collisions, rewrite
 	// temp paths to "host:/remote/path" form.
-	ephemeral               bool
-	idPrefix                string
-	pathRewriter            func(string) string
-	emitter                 Emitter
-	providerFactories       map[parser.AgentType]parser.ProviderFactory
-	providerMigrationModes  map[parser.AgentType]parser.ProviderMigrationMode
-	providerWatchRootsMu    gosync.Mutex
-	providerWatchRoots      map[parser.AgentType][]parser.WatchRoot
-	openCodeWatchMu         gosync.Mutex
-	openCodeWatch           map[string]openCodeWatchState
+	ephemeral              bool
+	idPrefix               string
+	pathRewriter           func(string) string
+	emitter                Emitter
+	providerFactories      map[parser.AgentType]parser.ProviderFactory
+	providerMigrationModes map[parser.AgentType]parser.ProviderMigrationMode
+	providerWatchRootsMu   gosync.Mutex
+	providerWatchRoots     map[parser.AgentType][]parser.WatchRoot
+	openCodeWatchMu        gosync.Mutex
+	openCodeWatch          map[string]openCodeWatchState
 	// stagedOpenCodeWatch holds a pre-discovery journal baseline captured during
 	// resyncBuildLocked. It is installed only after a successful swap so a
 	// discarded rebuild cannot advance the watcher watermark.
-	stagedOpenCodeWatch map[string]openCodeWatchState
+	stagedOpenCodeWatch     map[string]openCodeWatchState
 	projectIdentityMu       gosync.Mutex
 	projectIdentityCache    map[string]projectIdentityCacheEntry
 	projectIdentityWritten  map[string]struct{}
@@ -993,7 +993,7 @@ func (e *Engine) classifyProviderChangedPath(
 
 	for _, agentType := range agents {
 		if ctx.Err() != nil {
-			return files
+			return files, classificationErr
 		}
 		mode := e.providerMigrationModes[agentType]
 		switch mode {

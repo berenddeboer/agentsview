@@ -7368,12 +7368,12 @@ func TestOpenCodeWatchCoalescesIntermediateEvents(t *testing.T) {
 		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenCode: {root}},
 	})
 
-	assert.Empty(t, engine.classifyPaths([]string{dbPath}))
+	assert.Empty(t, requireClassifyPaths(t, engine, []string{dbPath}))
 	addOpenCodeSQLiteTestEvent(
 		t, dbPath, "evt_002", "ses_stream", "message.part.updated.1",
 		`{"time":2}`, 2,
 	)
-	assert.Empty(t, engine.classifyPaths([]string{dbPath}))
+	assert.Empty(t, requireClassifyPaths(t, engine, []string{dbPath}))
 
 	engine.openCodeWatchMu.Lock()
 	_, pending := engine.openCodeWatch[dbPath].pending["ses_stream"]
@@ -7384,7 +7384,7 @@ func TestOpenCodeWatchCoalescesIntermediateEvents(t *testing.T) {
 		t, dbPath, "evt_003", "ses_stream", "message.updated.1",
 		`{"info":{"role":"assistant","time":{"completed":3}}}`, 3,
 	)
-	files := engine.classifyPaths([]string{dbPath})
+	files := requireClassifyPaths(t, engine, []string{dbPath})
 	require.Len(t, files, 1)
 	assert.Equal(t, parser.OpenCodeSQLiteVirtualPath(dbPath, "ses_stream"), files[0].Path)
 }
@@ -7397,14 +7397,14 @@ func TestOpenCodeWatchJournalOverflowStaysBounded(t *testing.T) {
 	engine := NewEngine(database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenCode: {root}},
 	})
-	assert.Empty(t, engine.classifyPaths([]string{dbPath}))
+	assert.Empty(t, requireClassifyPaths(t, engine, []string{dbPath}))
 	for seq := 2; seq <= openCodeJournalBatchLimit+2; seq++ {
 		addOpenCodeSQLiteTestEvent(
 			t, dbPath, fmt.Sprintf("evt_%03d", seq), "ses_overflow",
 			"message.part.updated.1", `{"time":2}`, seq,
 		)
 	}
-	assert.Empty(t, engine.classifyPaths([]string{dbPath}))
+	assert.Empty(t, requireClassifyPaths(t, engine, []string{dbPath}))
 	engine.openCodeWatchMu.Lock()
 	state := engine.openCodeWatch[dbPath]
 	engine.openCodeWatchMu.Unlock()
@@ -7420,7 +7420,7 @@ func TestOpenCodeWatchPendingOverflowClearsState(t *testing.T) {
 	engine := NewEngine(database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenCode: {root}},
 	})
-	assert.Empty(t, engine.classifyPaths([]string{dbPath}))
+	assert.Empty(t, requireClassifyPaths(t, engine, []string{dbPath}))
 	for i := 0; i <= openCodePendingLimit; i++ {
 		addOpenCodeSQLiteTestEvent(
 			t, dbPath, fmt.Sprintf("evt-pending-%03d", i),
@@ -7428,7 +7428,7 @@ func TestOpenCodeWatchPendingOverflowClearsState(t *testing.T) {
 			`{"time":2}`, 1,
 		)
 	}
-	assert.Empty(t, engine.classifyPaths([]string{dbPath}))
+	assert.Empty(t, requireClassifyPaths(t, engine, []string{dbPath}))
 	engine.openCodeWatchMu.Lock()
 	state := engine.openCodeWatch[dbPath]
 	engine.openCodeWatchMu.Unlock()
