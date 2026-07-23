@@ -920,9 +920,6 @@ func (e *Engine) classifyPaths(
 	files := make([]parser.DiscoveredFile, 0, len(paths))
 	var classificationErr error
 	for _, p := range paths {
-		if ctx.Err() != nil {
-			break
-		}
 		// Codex resolved-index events map to potentially several session
 		// sources and must classify even when the event path was deleted, so
 		// they are handled by classifyCodexIndexPath. All other changed paths,
@@ -992,9 +989,6 @@ func (e *Engine) classifyProviderChangedPath(
 	})
 
 	for _, agentType := range agents {
-		if ctx.Err() != nil {
-			return files, classificationErr
-		}
 		mode := e.providerMigrationModes[agentType]
 		switch mode {
 		case parser.ProviderMigrationProviderAuthoritative:
@@ -1050,9 +1044,6 @@ func (e *Engine) classifyProviderChangedPath(
 			continue
 		}
 		for _, watchRoot := range watchRoots {
-			if ctx.Err() != nil {
-				return files, classificationErr
-			}
 			request := parser.ChangedPathRequest{
 				Path:      path,
 				EventKind: eventKind,
