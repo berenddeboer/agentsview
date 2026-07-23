@@ -940,13 +940,16 @@ func TestParseOpenCodeDB_SkillNameFromReadToolRelativePath(t *testing.T) {
 	// Frontmatter name intentionally differs from the folder name
 	// ("renamed") to prove we read frontmatter, not the directory.
 	path := writeTestSkill(t, "renamed", "actual-skill")
-	worktree := filepath.Dir(filepath.Dir(filepath.Dir(path)))
+	directory := filepath.Dir(filepath.Dir(filepath.Dir(path)))
 
 	dbPath, seeder, db := newTestDB(t)
 	defer db.Close()
 
-	seeder.AddProject("prj_1", worktree)
-	seeder.AddSession("ses_rel", "prj_1", "", "", 1700000000000, 1700000030000)
+	seeder.AddProject("prj_1", filepath.Join(t.TempDir(), "project-root"))
+	seeder.AddSessionDirectory(
+		"ses_rel", "prj_1", "", "", directory,
+		1700000000000, 1700000030000,
+	)
 
 	seeder.AddMessage("msg_u", "ses_rel", 1700000000000, 1700000000000, `{"role":"user"}`)
 	seeder.AddPart("prt_u", "msg_u", "ses_rel", 1700000000000, 1700000000000, `{"type":"text","text":"read the skill"}`)
@@ -1117,6 +1120,39 @@ func TestParseOpenCodeDB_PrefersSessionDirectoryOverGlobalProject(t *testing.T) 
 	assert.Equal(t, "/home/user/code/lonely-app", s.Cwd)
 	assert.Equal(t, "lonely_app", s.Project)
 	assert.NotEqual(t, "unknown", s.Project)
+}
+
+func TestParseOpenCodeDB_ProjectFromUnavailableProjectWorktree(t *testing.T) {
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+
+	worktree := filepath.Join(t.TempDir(), "unavailable-repo")
+	directory := filepath.Join(worktree, "subdir")
+	_, err := os.Stat(worktree)
+	require.Error(t, err)
+	require.True(t, os.IsNotExist(err), "project checkout must be unavailable")
+
+	seeder.AddProject("prj_unavailable", worktree)
+	seeder.AddSessionDirectory(
+		"ses_subdir", "prj_unavailable", "", "Unavailable Checkout",
+		directory, 1700000000000, 1700000010000,
+	)
+	seeder.AddMessage(
+		"msg_1", "ses_subdir", 1700000000000, 1700000000000,
+		`{"role":"user"}`,
+	)
+	seeder.AddPart(
+		"prt_1", "msg_1", "ses_subdir",
+		1700000000000, 1700000000000,
+		`{"type":"text","text":"hello"}`,
+	)
+
+	sessions, err := parseOpenCodeAll(dbPath, "testmachine")
+	require.NoError(t, err)
+	require.Len(t, sessions, 1)
+
+	assert.Equal(t, directory, sessions[0].Session.Cwd)
+	assert.Equal(t, "unavailable_repo", sessions[0].Session.Project)
 }
 
 func TestParseOpenCodeDB_EmptySessionDirectoryUsesProjectWorktree(t *testing.T) {

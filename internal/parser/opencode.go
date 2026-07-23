@@ -163,11 +163,13 @@ func parseOpenCodeDBSession(
 		)
 	}
 
-	worktree := resolveOpenCodeWorktree(
-		s.directory, projects[s.projectID],
-	)
+	projectWorktree := strings.TrimSpace(projects[s.projectID])
+	cwd := resolveOpenCodeWorktree(s.directory, projectWorktree)
+	if !openCodeUsableWorktree(projectWorktree) {
+		projectWorktree = cwd
+	}
 	return buildOpenCodeSession(
-		db, s, worktree, dbPath, machine,
+		db, s, cwd, projectWorktree, dbPath, machine,
 	)
 }
 
@@ -250,6 +252,7 @@ func parseOpenCodeStorageFile(
 			timeUpdated: sf.Time.Updated,
 		},
 		sf.Directory,
+		sf.Directory,
 		sessionPath,
 		fileMtime,
 		machine,
@@ -267,6 +270,7 @@ func parseOpenCodeStorageFile(
 			timeCreated: sf.Time.Created,
 			timeUpdated: sf.Time.Updated,
 		},
+		sf.Directory,
 		sf.Directory,
 		msgs,
 		parts,
@@ -535,6 +539,7 @@ type openCodeStorageFingerprintSession struct {
 	ProjectID   string `json:"project_id,omitempty"`
 	ParentID    string `json:"parent_id,omitempty"`
 	Title       string `json:"title,omitempty"`
+	Directory   string `json:"directory,omitempty"`
 	Worktree    string `json:"worktree,omitempty"`
 	TimeCreated int64  `json:"time_created,omitempty"`
 	TimeUpdated int64  `json:"time_updated,omitempty"`
@@ -615,7 +620,7 @@ func loadOpenCodeParts(
 func buildOpenCodeSession(
 	db *sql.DB,
 	s openCodeSessionRow,
-	worktree, dbPath, machine string,
+	cwd, projectWorktree, dbPath, machine string,
 ) (*ParsedSession, []ParsedMessage, error) {
 	msgs, err := loadOpenCodeMessages(db, s.id)
 	if err != nil {
@@ -633,7 +638,8 @@ func buildOpenCodeSession(
 
 	sess, parsed, err := buildOpenCodeParsedSession(
 		s,
-		worktree,
+		cwd,
+		projectWorktree,
 		dbPath+"#"+s.id,
 		s.timeUpdated*1_000_000,
 		machine,
@@ -644,14 +650,14 @@ func buildOpenCodeSession(
 		return sess, parsed, err
 	}
 	sess.File.Hash = buildOpenCodeSessionFingerprint(
-		s, worktree, msgs, parts,
+		s, cwd, projectWorktree, msgs, parts,
 	)
 	return sess, parsed, nil
 }
 
 func buildOpenCodeParsedSession(
 	s openCodeSessionRow,
-	worktree, filePath string,
+	cwd, projectWorktree, filePath string,
 	fileMtime int64,
 	machine string,
 	msgs []openCodeMessageRow,
@@ -695,7 +701,7 @@ func buildOpenCodeParsedSession(
 		})
 
 		pm := buildOpenCodeMessage(
-			ordinal, role, m.timeCreated, msgParts, worktree,
+			ordinal, role, m.timeCreated, msgParts, cwd,
 		)
 		applyOpenCodeTokenUsage(&pm, md, m.data, msgParts)
 		if strings.TrimSpace(pm.Content) == "" &&
@@ -718,7 +724,7 @@ func buildOpenCodeParsedSession(
 		return nil, nil, nil
 	}
 
-	project := ExtractProjectFromCwd(worktree)
+	project := ExtractProjectFromCwd(projectWorktree)
 	if project == "" {
 		project = "unknown"
 	}
@@ -743,7 +749,7 @@ func buildOpenCodeParsedSession(
 		Project:          project,
 		Machine:          machine,
 		Agent:            AgentOpenCode,
-		Cwd:              worktree,
+		Cwd:              cwd,
 		ParentSessionID:  parentID,
 		FirstMessage:     firstMsg,
 		StartedAt:        startedAt,
@@ -1279,7 +1285,7 @@ func buildOpenCodeStorageFingerprint(
 
 func buildOpenCodeSessionFingerprint(
 	s openCodeSessionRow,
-	worktree string,
+	directory, worktree string,
 	msgs []openCodeMessageRow,
 	parts map[string][]openCodePartRow,
 ) string {
@@ -1289,6 +1295,7 @@ func buildOpenCodeSessionFingerprint(
 			ProjectID:   s.projectID,
 			ParentID:    s.parentID,
 			Title:       s.title,
+			Directory:   directory,
 			Worktree:    worktree,
 			TimeCreated: s.timeCreated,
 			TimeUpdated: s.timeUpdated,
