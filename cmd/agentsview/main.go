@@ -341,6 +341,11 @@ func runServe(cfg config.Config, opts serveOptions) {
 			},
 		)
 		defer stopWatcher()
+		// Establish the live engine's disposable journal watermark after
+		// collection begins and before startup reconciliation. An in-process
+		// full sync may replace it; worker-backed startup needs it so the first
+		// queued settlement is not consumed as a lazy baseline.
+		engine.InitializeOpenCodeWatchBaseline(ctx)
 		onStartupReconciled = newStartupReconciliationHandler(
 			ctx,
 			database.CheckpointWALTruncateWithRetry,

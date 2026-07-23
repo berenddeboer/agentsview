@@ -95,6 +95,7 @@ func (e *Engine) classifyOpenCodeJournalPath(
 			delete(state.pending, event.SessionID)
 			continue
 		}
+		delete(ready, event.SessionID)
 		state.pending[event.SessionID] = struct{}{}
 		if len(state.pending) > openCodePendingLimit {
 			state.pending = make(map[string]struct{})
@@ -140,6 +141,17 @@ func (e *Engine) classifyOpenCodeJournalPath(
 	return sources, true
 }
 
+// InitializeOpenCodeWatchBaseline establishes the live engine's disposable
+// journal watermark before an authoritative startup reconciliation. Watcher
+// collection must already be active so events committed after this capture are
+// queued for dispatch.
+func (e *Engine) InitializeOpenCodeWatchBaseline(ctx context.Context) {
+	baselines, ok := e.captureOpenCodeWatchBaseline(ctx)
+	if ok {
+		e.installOpenCodeWatchBaseline(baselines)
+	}
+}
+
 func (e *Engine) captureOpenCodeWatchBaseline(
 	ctx context.Context,
 ) (map[string]openCodeWatchState, bool) {
@@ -151,6 +163,16 @@ func (e *Engine) captureOpenCodeWatchBaseline(
 		dbPath := parser.ResolveOpenCodeSource(filepath.Clean(root)).DBPath
 		if dbPath == "" {
 			continue
+		}
+		info, err := os.Stat(dbPath)
+		if os.IsNotExist(err) || (err == nil && (info == nil || !info.Mode().IsRegular())) {
+			continue
+		}
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Printf("opencode watcher baseline stat: %v", err)
+			}
+			return nil, false
 		}
 		high, supported, err := parser.OpenCodeJournalHighWater(ctx, dbPath)
 		if err != nil {

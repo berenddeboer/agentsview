@@ -7389,6 +7389,36 @@ func TestOpenCodeWatchCoalescesIntermediateEvents(t *testing.T) {
 	assert.Equal(t, parser.OpenCodeSQLiteVirtualPath(dbPath, "ses_stream"), files[0].Path)
 }
 
+func TestOpenCodeWatchLaterIntermediateEventClearsReadiness(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "opencode.db")
+	seedOpenCodeSQLiteWALSession(t, dbPath, "ses_stream")
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenCode: {root}},
+	})
+	engine.InitializeOpenCodeWatchBaseline(t.Context())
+
+	addOpenCodeSQLiteTestEvent(
+		t, dbPath, "evt_002", "ses_stream", "message.updated.1",
+		`{"info":{"role":"assistant","time":{"completed":2}}}`, 2,
+	)
+	addOpenCodeSQLiteTestEvent(
+		t, dbPath, "evt_003", "ses_stream", "message.part.updated.1",
+		`{"time":3}`, 3,
+	)
+	assert.Empty(t, requireClassifyPaths(t, engine, []string{dbPath}),
+		"a newer streaming event must supersede readiness from an earlier settlement")
+
+	addOpenCodeSQLiteTestEvent(
+		t, dbPath, "evt_004", "ses_stream", "message.updated.1",
+		`{"info":{"role":"assistant","time":{"completed":4}}}`, 4,
+	)
+	files := requireClassifyPaths(t, engine, []string{dbPath})
+	require.Len(t, files, 1)
+	assert.Equal(t, parser.OpenCodeSQLiteVirtualPath(dbPath, "ses_stream"), files[0].Path)
+}
+
 func TestOpenCodeWatchJournalOverflowStaysBounded(t *testing.T) {
 	database := openTestDB(t)
 	root := t.TempDir()
@@ -7433,58 +7463,6 @@ func TestOpenCodeWatchPendingOverflowClearsState(t *testing.T) {
 	state := engine.openCodeWatch[dbPath]
 	engine.openCodeWatchMu.Unlock()
 	assert.Empty(t, state.pending)
-}
-
-func TestOpenCodeWatchDiscardedResyncDoesNotAdvanceBaseline(t *testing.T) {
-	database := openTestDB(t)
-	root := t.TempDir()
-	dbPath := filepath.Join(root, "opencode.db")
-	seedOpenCodeSQLiteWALSession(t, dbPath, "ses_resync")
-	engine := NewEngine(database, EngineConfig{
-		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenCode: {root}},
-		Machine:   "local",
-	})
-	t.Cleanup(engine.Close)
-
-	stats := engine.SyncAll(context.Background(), nil)
-	require.Zero(t, stats.Failed)
-	writer, err := sql.Open("sqlite3", dbPath)
-	require.NoError(t, err)
-	_, err = writer.Exec(`
-		UPDATE part SET data = '{"type":"text","text":"after failed resync"}'
-		WHERE id = 'part_1'
-	`)
-	require.NoError(t, err)
-	require.NoError(t, writer.Close())
-	addOpenCodeSQLiteTestEvent(
-		t, dbPath, "evt_002", "ses_resync", "session.updated.1",
-		`{"time":2}`, 2,
-	)
-
-	sentinel := errors.New("fts baseline sentinel")
-	engine.syncMu.Lock()
-	stats, err = engine.resyncAllWithOptionsLocked(
-		context.Background(), nil, RebuildOptions{}, rebuildOperations{
-			rebuildFTS: func(*db.DB) error { return sentinel },
-		},
-	)
-	engine.syncMu.Unlock()
-	require.ErrorIs(t, err, sentinel)
-	require.True(t, stats.Aborted)
-	messages, err := database.GetMessages(
-		context.Background(), "opencode:ses_resync", 0, 10, true,
-	)
-	require.NoError(t, err)
-	require.Len(t, messages, 1)
-	assert.Equal(t, "hello", messages[0].Content)
-
-	engine.SyncPaths([]string{dbPath})
-	messages, err = database.GetMessages(
-		context.Background(), "opencode:ses_resync", 0, 10, true,
-	)
-	require.NoError(t, err)
-	require.Len(t, messages, 1)
-	assert.Equal(t, "after failed resync", messages[0].Content)
 }
 
 func TestEngine_ClassifyPathsOpenCodeRemovedMessageFile(

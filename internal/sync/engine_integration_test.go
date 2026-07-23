@@ -817,6 +817,47 @@ func TestSyncEngineOpenCodeEventCommittedDuringFullSyncRemainsWatchable(
 	assertMessageContent(t, env.db, sessionID, "late prompt", "late answer")
 }
 
+func TestSyncEngineOpenCodeLiveEngineProcessesFirstPostStartupSettlement(
+	t *testing.T,
+) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	oc := createOpenCodeDB(t, env.opencodeDir)
+	oc.addProject(t, "proj", "/home/user/code/opencode-app")
+	seedOpenCodeSQLiteTextSession(
+		t, oc, "proj", "ses_startup",
+		1779012000000, 1779012030000,
+		"original prompt", "original answer",
+	)
+
+	stats := env.engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted)
+	parent := sync.NewEngine(env.db, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentOpenCode: {env.opencodeDir},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(parent.Close)
+	parent.InitializeOpenCodeWatchBaseline(t.Context())
+	require.NoError(t, parent.ReconcileWatchRoots(
+		t.Context(), []string{env.opencodeDir}, false,
+	))
+
+	oc.replaceTextContent(
+		t, "ses_startup", "first live prompt", "first live answer",
+		1779012000000,
+	)
+	oc.addEvent(
+		t, "evt_first_live", "ses_startup", "session.updated.1",
+		`{"time":1}`, 1,
+	)
+	parent.SyncPaths([]string{oc.path})
+	assertMessageContent(
+		t, env.db, "opencode:ses_startup",
+		"first live prompt", "first live answer",
+	)
+}
+
 // TestSyncEngineOpenCodeSQLiteUntouchedContainerSkipsReparse pins the
 // container-level freshness gate: when the shared opencode.db file is
 // completely untouched since the last verified sync, its sessions must be
