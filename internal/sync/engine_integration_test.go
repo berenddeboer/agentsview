@@ -6061,6 +6061,55 @@ func TestSyncEngineOpenCodeBulkSync(t *testing.T) {
 	)
 }
 
+func TestSyncEngineOpenCodeDataVersionRefreshesUnchangedCwdProject(
+	t *testing.T,
+) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	oc := createOpenCodeDB(t, env.opencodeDir)
+	oc.mustExec(t, "add session directory column",
+		`ALTER TABLE session
+		 ADD COLUMN directory TEXT NOT NULL DEFAULT ''`,
+	)
+	oc.addProject(t, "global", "/")
+
+	const sessionID = "oc-global-session"
+	oc.mustExec(t, "insert session directory",
+		`INSERT INTO session
+			(id, project_id, directory, time_created, time_updated)
+		 VALUES (?, ?, ?, ?, ?)`,
+		sessionID, "global", "/home/user/code/lonely-app",
+		int64(1704067200000), int64(1704067205000),
+	)
+	oc.addMessage(t, "msg-u1", sessionID, "user", 1704067200000)
+	oc.addTextPart(
+		t, "part-u1", sessionID, "msg-u1", "hello", 1704067200000,
+	)
+
+	stats := env.engine.SyncAll(context.Background(), nil)
+	require.Equal(t, 1, stats.Synced)
+
+	agentviewID := "opencode:" + sessionID
+	stored := openCodeStoredSession(t, env.db, agentviewID)
+	stored.Cwd = "/"
+	stored.Project = "unknown"
+	require.NoError(t, env.db.UpsertSession(*stored))
+	require.NoError(t, env.db.SetSessionDataVersion(agentviewID, 70))
+
+	sourceState, ok := parser.StatSQLiteContainerState(oc.path)
+	require.True(t, ok)
+	stats = env.engine.SyncAll(context.Background(), nil)
+	require.Equal(t, 1, stats.Synced)
+	afterState, ok := parser.StatSQLiteContainerState(oc.path)
+	require.True(t, ok)
+	assert.Equal(t, sourceState, afterState, "source database must remain unchanged")
+
+	assertSessionState(t, env.db, agentviewID, func(sess *db.Session) {
+		assert.Equal(t, "/home/user/code/lonely-app", sess.Cwd)
+		assert.Equal(t, "lonely_app", sess.Project)
+		assert.Equal(t, db.CurrentDataVersion(), sess.DataVersion)
+	})
+}
+
 func TestSyncEngineOpenCodeReviewWithGeneratedTitleIsAutomated(
 	t *testing.T,
 ) {

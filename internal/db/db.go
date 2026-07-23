@@ -318,7 +318,10 @@ const projectIdentityRemoteScrubCompletedKey = "project_identity_remote_scrub_v1
 // and model replaces the single last-payload event per session, with
 // occurred_at from each turn's timestamp. Existing Grok rows undercount
 // multi-turn sessions and need re-parsing.)
-const dataVersion = 70
+// (71: OpenCode SQLite cwd/project derivation now prefers a concrete
+// session.directory over the synthetic global project worktree "/". Existing
+// OpenCode rows need re-parsing so unchanged sessions refresh cwd and project.)
+const dataVersion = 71
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 

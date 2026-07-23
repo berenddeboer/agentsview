@@ -1007,9 +1007,9 @@ func TestMigration_ToolResultEventsTable(t *testing.T) {
 		"expected tool_result_events table after reopen")
 }
 
-func TestCurrentDataVersionGrokPerTurnUsage(t *testing.T) {
-	assert.Equal(t, 70, CurrentDataVersion(),
-		"Grok per-turn usage parsing requires a data version bump")
+func TestCurrentDataVersionOpenCodeSessionDirectory(t *testing.T) {
+	assert.Equal(t, 71, CurrentDataVersion(),
+		"OpenCode cwd/project derivation requires a data version bump")
 }
 
 func TestInsertMessages_PreservesToolResultEvents(t *testing.T) {
