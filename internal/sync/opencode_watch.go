@@ -83,6 +83,11 @@ func (e *Engine) classifyOpenCodeJournalPath(
 	}
 	state.rowID = batch.HighRowID
 	if !batch.Safe || batch.Overflow {
+		// Advancing past the range is deliberate. Retaining it would reread the
+		// same capped page on every later watcher event, while paging, retrying,
+		// or starting scoped reconciliation would recreate the cursor/retry
+		// subsystem rejected by #1208. Startup and the daily authoritative full
+		// sync repair sessions deferred by this bounded best-effort path.
 		state.pending = make(map[string]struct{})
 		e.openCodeWatch[dbPath] = state
 		e.openCodeWatchMu.Unlock()

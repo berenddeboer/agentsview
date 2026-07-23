@@ -779,6 +779,56 @@ func TestSyncEngineOpenCodeJournalDefersStreamingUntilSettlement(
 	assert.Equal(t, *after.LocalModifiedAt, *unchanged.LocalModifiedAt)
 }
 
+func TestSyncEngineOpenCodeJournalOverflowDefersRepairToFullSync(
+	t *testing.T,
+) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	oc := createOpenCodeDB(t, env.opencodeDir)
+	oc.addProject(t, "proj", "/home/user/code/opencode-app")
+	seedOpenCodeSQLiteTextSession(
+		t, oc, "proj", "ses_overflow_repair",
+		1779012000000, 1779012030000,
+		"original prompt", "original answer",
+	)
+
+	stats := env.engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted)
+	require.Equal(t, 1, stats.Synced)
+	oc.replaceTextContent(
+		t, "ses_overflow_repair", "repaired prompt", "repaired answer",
+		1779012000000,
+	)
+	// The watcher reads at most 256 journal rows; the settlement is the
+	// overflow sentinel and must be deferred rather than parsed immediately.
+	for seq := 1; seq <= 256; seq++ {
+		oc.addEvent(
+			t, fmt.Sprintf("evt_overflow_%03d", seq),
+			"ses_overflow_repair", "message.part.updated.1",
+			`{"time":1}`, seq,
+		)
+	}
+	oc.addEvent(
+		t, "evt_overflow_settlement", "ses_overflow_repair",
+		"message.updated.1",
+		`{"info":{"role":"assistant","time":{"completed":2}}}`,
+		257,
+	)
+
+	require.NoError(t, env.engine.SyncPathsContext(t.Context(), []string{oc.path}))
+	assertMessageContent(
+		t, env.db, "opencode:ses_overflow_repair",
+		"original prompt", "original answer",
+	)
+
+	stats = env.engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted)
+	assert.Equal(t, 1, stats.Synced)
+	assertMessageContent(
+		t, env.db, "opencode:ses_overflow_repair",
+		"repaired prompt", "repaired answer",
+	)
+}
+
 func TestSyncEngineOpenCodeEventCommittedDuringFullSyncRemainsWatchable(
 	t *testing.T,
 ) {
