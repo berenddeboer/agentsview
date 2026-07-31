@@ -41,6 +41,29 @@ The hybrid union is the expensive case: discovery must enumerate the whole
 JSON tree *and* every `session` row, and the watcher must cover the whole
 root recursively.
 
+### Can the JSON tree be ignored in hybrid mode? No
+
+The importer copied JSON into the DB, so the DB should be a superset — but
+it gives no guarantee, and it can never repair itself:
+
+- It ran only when `opencode.db` did not exist; the DB file is the marker.
+  A migration killed midway rolls back its transaction but leaves the file,
+  so the import never retries: history stays JSON-only beside a near-empty
+  DB.
+- It only existed between 2026-02-13 (`6d95f0d14c`) and 2026-06-02
+  (`ca2acc4f8d`). Upgrading from a pre-SQLite opencode straight past June
+  2026 creates a fresh empty DB and never imports at all.
+- Even a successful run was best-effort: unreadable files skipped, a failed
+  insert drops its whole 1000-record batch, sessions with a missing project
+  JSON skipped as orphans, all inserts `onConflictDoNothing` — nothing is
+  repaired later.
+
+So JSON-only sessions genuinely exist on some installs. The saving grace:
+the JSON tree is frozen — opencode has not written sessions, messages, or
+parts there since Feb 2026. It needs one-time backfill into agentsview's
+archive (which preserves sessions whose source files vanish), not live
+per-event sync.
+
 ## Old style: flat JSON tree layout
 
 ```text
