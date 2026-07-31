@@ -115,7 +115,7 @@ type session (A30) = project, parent, title, directory,
                      tokens_cache_read, tokens_cache_write.
 type message (A30) = session, time_created, time_updated, data.
 type part    (A30) = message, time_created, time_updated, data.
-type event   (I10) = aggregate, seq, type, data.
+type event   (A30) = session, seq, type, data.
 
 end.
 ```
@@ -129,10 +129,15 @@ Notes:
   `part.data` holds `type` (`text`, `reasoning`, `tool`, `step-finish`, ...)
   and its payload. agentsview parses both blobs with gjson/`json.Unmarshal`;
   blobs can be tens of megabytes.
-- `event` is an append-only journal (`rowid` is a natural cursor;
-  `aggregate` is the session id; `type` like `message.part.updated.1`).
-  It is the only table that records *what changed* — the session/message/
-  part tables are projections of it.
+- `event` is an append-only journal; the session/message/part tables are
+  projections of it, and it is the only table that records *what changed*.
+  Its `session` attribute is the `aggregate_id` column: every durable event
+  definition in opencode aggregates on `sessionID`, so it always holds a
+  session id — but in SQL it is not a foreign key to `session` (events can
+  name sessions whose projection row was deleted). Events do not reference
+  message or part directly; those ids ride inside `data`. The key is a
+  text `evt_*` id; SQLite's implicit `rowid` is the natural sync cursor.
+  `type` looks like `message.part.updated.1`.
 - Session `cost` and token columns exist but agentsview recomputes tokens
   from message data and `step-finish` parts instead.
 
