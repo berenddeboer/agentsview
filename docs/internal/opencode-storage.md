@@ -64,6 +64,26 @@ parts there since Feb 2026. It needs one-time backfill into agentsview's
 archive (which preserves sessions whose source files vanish), not live
 per-event sync.
 
+### Verifying completeness, then ignoring the JSON tree
+
+Checking "DB contains everything the JSON tree has" is mechanically cheap —
+every id is in the filename (the importer also keyed on filenames), so a
+verifier walks directory entries and probes indexed primary keys without
+parsing any JSON. But it is unsound: a session or message deleted in
+opencode after migration is gone from the DB while its JSON remains, and an
+id-diff cannot distinguish that from an import gap.
+
+The sound check is against agentsview's own archive instead: has agentsview
+ingested every id in the JSON tree? That is answerable from agentsview's
+data alone, is indifferent to opencode-side deletions (the archive
+preserves deleted sessions anyway), and because the tree is frozen it is a
+one-time backfill — walk once, ingest what is missing, persist a per-root
+completion marker, then treat the root as SQLite-only.
+
+One deliberate behavior change hides here: today storage JSON shadows the
+same-id SQLite row; after backfill-and-ignore, the DB row wins for
+sessions present in both.
+
 ## Old style: flat JSON tree layout
 
 ```text
